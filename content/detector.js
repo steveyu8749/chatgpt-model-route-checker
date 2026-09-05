@@ -15,12 +15,32 @@
   const MAX_SCAN_DEPTH = 18;
   const MAX_SCAN_NODES = 12000;
   const STREAM_BUFFER_LIMIT = 2 * 1024 * 1024;
-  const timing = window.ChatGPTRouteTiming;
-  const MODEL_METADATA_WAIT_WINDOW_MS =
-    timing && timing.MODEL_METADATA_WAIT_WINDOW_MS;
+  // `timing.js` is normally loaded immediately before this file in the MAIN
+  // world.  Content-script ordering across worlds can nevertheless vary, and
+  // an earlier page script can replace the shared object.  A missing or
+  // malformed timing object must not disable the request bridge: use the
+  // same six-second policy as a bounded local fallback.
+  const FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS = 6000;
+  function modelMetadataWaitWindow() {
+    try {
+      const shared = window.ChatGPTRouteTiming;
+      const value = shared && shared.MODEL_METADATA_WAIT_WINDOW_MS;
+      // Accept only the versioned six-second policy.  A different finite
+      // value is still a configuration drift, not a reason to let the two
+      // worlds silently wait for different durations.
+      const normalized = Number.isFinite(value) ? Math.floor(value) : null;
+      return normalized === FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS
+        ? normalized
+        : FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+    } catch {
+      return FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+    }
+  }
+  const MODEL_METADATA_WAIT_WINDOW_MS = modelMetadataWaitWindow();
   const ACTIVE_RECORD_RETENTION_MS = 5 * 60 * 1000;
   const ENDED_RECORD_RETENTION_MS = 15000;
   const RESPONSE_PROGRESS_INTERVAL_MS = 1000;
+  const DETECTOR_VERSION = "1.1.3";
   const SKIP_RECURSION_KEYS = new Set([
     "content",
     "parts",
@@ -33,9 +53,22 @@
   ]);
   const stateKey = "__CHATGPT_MODEL_ROUTE_CHECKER_MAIN_V1__";
 
-  if (!Number.isFinite(MODEL_METADATA_WAIT_WINDOW_MS)) return;
   if (window[stateKey]) return;
-  window[stateKey] = true;
+  window[stateKey] = {
+    detectorVersion: DETECTOR_VERSION,
+    timingWindowMs: MODEL_METADATA_WAIT_WINDOW_MS
+  };
+
+  let fetchWrapper = null;
+  let xhrOpenWrapper = null;
+  let xhrSendWrapper = null;
+  let beaconWrapper = null;
+  let fetchInstallAttempted = false;
+  let xhrInstallAttempted = false;
+  let beaconInstallAttempted = false;
+  let fetchInstallSucceeded = false;
+  let xhrInstallSucceeded = false;
+  let beaconInstallSucceeded = false;
 
   let sequence = 0;
   const conversationRecords = new Map();
@@ -175,6 +208,89 @@
       // The page may be navigating or have an unusual origin. Detection is
       // best-effort and must never interfere with ChatGPT itself.
     }
+  }
+
+  function safeGet(object, key) {
+    try {
+      return object && object[key];
+    } catch {
+      return undefined;
+    }
+  }
+
+  function wrapperStatus(attempted, installed, current, wrapper) {
+    if (!attempted || typeof wrapper !== "function") return "unavailable";
+    if (!installed) return "failed";
+    return current === wrapper ? "installed" : "overwritten";
+  }
+
+  function xhrWrapperStatus() {
+    if (
+      !xhrInstallAttempted ||
+      !xhrInstallSucceeded ||
+      !xhrOpenWrapper ||
+      !xhrSendWrapper
+    ) {
+      return "unavailable";
+    }
+
+    const constructor =
+      safeGet(window, "XMLHttpRequest") ||
+      (typeof XMLHttpRequest !== "undefined" ? XMLHttpRequest : null);
+    const prototype = safeGet(constructor, "prototype");
+    const open = safeGet(prototype, "open");
+    const send = safeGet(prototype, "send");
+    return open === xhrOpenWrapper && send === xhrSendWrapper
+      ? "installed"
+      : "overwritten";
+  }
+
+  function healthSnapshot() {
+    // Keep this object intentionally small and static.  It is sent through
+    // page-visible postMessage, so it must never include URLs, request IDs,
+    // headers, response data, or any account/chat information.
+    const pageNavigator = safeGet(window, "navigator") ||
+      (typeof navigator !== "undefined" ? navigator : null);
+    return {
+      detectorVersion: DETECTOR_VERSION,
+      fetch: wrapperStatus(
+        fetchInstallAttempted,
+        fetchInstallSucceeded,
+        safeGet(window, "fetch"),
+        fetchWrapper
+      ),
+      xhr: xhrWrapperStatus(),
+      beacon: wrapperStatus(
+        beaconInstallAttempted,
+        beaconInstallSucceeded,
+        safeGet(pageNavigator, "sendBeacon"),
+        beaconWrapper
+      )
+    };
+  }
+
+  function handleDetectorPing(event) {
+    try {
+      const data = event && event.data;
+      if (
+        !event ||
+        event.source !== window ||
+        event.origin !== window.location.origin ||
+        !data ||
+        data.channel !== CHANNEL ||
+        data.version !== 1 ||
+        data.type !== "detector-ping"
+      ) {
+        return;
+      }
+      emit("detector-pong", { health: healthSnapshot() });
+    } catch {
+      // A navigation or unusual host object must not affect ChatGPT.
+    }
+  }
+
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("message", handleDetectorPing, false);
   }
 
   function absoluteUrl(input) {
@@ -902,10 +1018,11 @@
   }
 
   function wrapFetch() {
-    const nativeFetch = window.fetch;
+    fetchInstallAttempted = true;
+    const nativeFetch = safeGet(window, "fetch");
     if (typeof nativeFetch !== "function") return;
 
-    window.fetch = function routeCheckerFetch(input, init) {
+    fetchWrapper = function routeCheckerFetch(input, init) {
       const url = typeof input === "string" ? input : input && input.url;
       const method = methodFor(input, init);
       const conversation = isConversation(url, method);
@@ -969,23 +1086,37 @@
         }
       );
     };
+
+    try {
+      window.fetch = fetchWrapper;
+      fetchInstallSucceeded = window.fetch === fetchWrapper;
+    } catch {
+      fetchInstallSucceeded = false;
+    }
   }
 
   function wrapXHR() {
-    if (typeof XMLHttpRequest === "undefined") return;
+    xhrInstallAttempted = true;
+    const XHR =
+      typeof XMLHttpRequest !== "undefined"
+        ? XMLHttpRequest
+        : safeGet(window, "XMLHttpRequest");
+    const proto = safeGet(XHR, "prototype");
+    const nativeOpen = safeGet(proto, "open");
+    const nativeSend = safeGet(proto, "send");
+    if (
+      !proto ||
+      typeof nativeOpen !== "function" ||
+      typeof nativeSend !== "function"
+    ) return;
 
-    const proto = XMLHttpRequest.prototype;
-    const nativeOpen = proto.open;
-    const nativeSend = proto.send;
-    if (typeof nativeOpen !== "function" || typeof nativeSend !== "function") return;
-
-    proto.open = function routeCheckerOpen(method, url) {
+    xhrOpenWrapper = function routeCheckerOpen(method, url) {
       this.__chatgptRouteMethod = String(method || "GET").toUpperCase();
       this.__chatgptRouteUrl = String(url || "");
       return nativeOpen.apply(this, arguments);
     };
 
-    proto.send = function routeCheckerSend(body) {
+    xhrSendWrapper = function routeCheckerSend(body) {
       const method = this.__chatgptRouteMethod || "GET";
       const url = this.__chatgptRouteUrl || "";
       const conversation = isConversation(url, method);
@@ -1103,30 +1234,46 @@
         throw error;
       }
     };
+
+    try {
+      proto.open = xhrOpenWrapper;
+      proto.send = xhrSendWrapper;
+      xhrInstallSucceeded =
+        proto.open === xhrOpenWrapper && proto.send === xhrSendWrapper;
+    } catch {
+      xhrInstallSucceeded = false;
+    }
   }
 
   function wrapBeacon() {
-    if (!navigator.sendBeacon) return;
+    beaconInstallAttempted = true;
+    const pageNavigator = safeGet(window, "navigator") ||
+      (typeof navigator !== "undefined" ? navigator : null);
+    const nativeBeacon = safeGet(pageNavigator, "sendBeacon");
+    if (typeof nativeBeacon !== "function") return;
 
-    const nativeBeacon = navigator.sendBeacon.bind(navigator);
+    beaconWrapper = function routeCheckerBeacon(url, data) {
+      if (isTelemetry(url, "POST")) {
+        bodyToText(data)
+          .then((text) => {
+            const requestIdValue = telemetryRequestId();
+            scanWholeText(text, requestIdValue);
+          })
+          .catch(() => {});
+      }
+      return nativeBeacon.apply(this, arguments);
+    };
     try {
-      navigator.sendBeacon = function routeCheckerBeacon(url, data) {
-        if (isTelemetry(url, "POST")) {
-          bodyToText(data)
-            .then((text) => {
-              const requestIdValue = telemetryRequestId();
-              scanWholeText(text, requestIdValue);
-            })
-            .catch(() => {});
-        }
-        return nativeBeacon(url, data);
-      };
+      pageNavigator.sendBeacon = beaconWrapper;
+      beaconInstallSucceeded = pageNavigator.sendBeacon === beaconWrapper;
     } catch {
       // Some browsers expose a non-writable sendBeacon.
+      beaconInstallSucceeded = false;
     }
   }
 
   wrapFetch();
   wrapXHR();
   wrapBeacon();
+  emit("detector-ready", { health: healthSnapshot() });
 })();

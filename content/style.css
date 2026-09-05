@@ -24,6 +24,14 @@
   border-color: #a1a1aa;
 }
 
+:host([data-collector="connecting"]) .route-card {
+  border-color: #d59b22;
+}
+
+:host([data-collector="disconnected"]) .route-card {
+  border-color: #a1a1aa;
+}
+
 .route-card {
   overflow: hidden;
   border: 1px solid #d9d9df;
@@ -86,6 +94,14 @@
 }
 
 :host([data-status="unavailable"]) .route-status {
+  color: #64646e;
+}
+
+:host([data-collector="connecting"]) .route-status {
+  color: #8a6914;
+}
+
+:host([data-collector="disconnected"]) .route-status {
   color: #64646e;
 }
 

@@ -6,9 +6,26 @@
   const HOST_ID = "__chatgpt_model_route_checker_host__";
   const MAX_TURNS = 8;
   const RESPONSE_WAIT_TIMEOUT_MS = 30000;
-  const timing = window.ChatGPTRouteTiming;
-  const MODEL_METADATA_WAIT_WINDOW_MS =
-    timing && timing.MODEL_METADATA_WAIT_WINDOW_MS;
+  const FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS = 6000;
+  function modelMetadataWaitWindow() {
+    try {
+      const shared = window.ChatGPTRouteTiming;
+      const value = shared && shared.MODEL_METADATA_WAIT_WINDOW_MS;
+      // Accept only the versioned six-second policy so a malformed or
+      // replaced object cannot make the two worlds wait for different times.
+      const normalized = Number.isFinite(value) ? Math.floor(value) : null;
+      return normalized === FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS
+        ? normalized
+        : FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+    } catch {
+      return FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+    }
+  }
+  const MODEL_METADATA_WAIT_WINDOW_MS = modelMetadataWaitWindow();
+  const DETECTOR_CONNECT_TIMEOUT_MS = 5000;
+  const DETECTOR_PING_INTERVAL_MS = 250;
+  const DETECTOR_RETRY_INTERVAL_MS = 1000;
+  const DETECTOR_HEALTHCHECK_INTERVAL_MS = 5000;
   const NETWORK_EVIDENCE_TYPES = new Set([
     "response-start",
     "response-progress",
@@ -21,6 +38,7 @@
   ]);
   const api = window.ChatGPTRouteVerdict;
   const turnState = window.ChatGPTRouteTurnState;
+  const detectorHealth = window.ChatGPTRouteDetectorHealth;
   const rules = window.CHATGPT_ROUTE_CHECKER_RULES || {
     equivalent: [],
     incompatible: []
@@ -29,15 +47,131 @@
   if (
     !api ||
     !turnState ||
-    !Number.isFinite(MODEL_METADATA_WAIT_WINDOW_MS) ||
+    !detectorHealth ||
     document.getElementById(HOST_ID)
   ) return;
 
   let expanded = false;
   let ui = null;
+  const detectorConnection = {
+    ...detectorHealth.createState(),
+    pingTimer: null,
+    timeoutTimer: null,
+    healthCheckTimer: null
+  };
 
   function clean(value, maxLength = 200) {
     return api.clean(value, maxLength);
+  }
+
+  function detectorConnectionLabel() {
+    switch (detectorConnection.status) {
+      case "connected":
+        return "已连接";
+      case "disconnected":
+        return "未连接";
+      default:
+        return "连接中";
+    }
+  }
+
+  function healthStatusLabel(value) {
+    switch (value) {
+      case "installed":
+        return "已安装";
+      case "overwritten":
+        return "已被页面覆盖";
+      case "failed":
+        return "安装失败";
+      default:
+        return "不可用";
+    }
+  }
+
+  function detectorHealthSummary() {
+    const health = detectorConnection.health;
+    if (!health) return "未确认";
+    return `fetch=${healthStatusLabel(health.fetch)}，XHR=${healthStatusLabel(
+      health.xhr
+    )}，beacon=${healthStatusLabel(health.beacon)}`;
+  }
+
+  function stopDetectorPing() {
+    if (detectorConnection.pingTimer) {
+      window.clearTimeout(detectorConnection.pingTimer);
+      detectorConnection.pingTimer = null;
+    }
+    if (detectorConnection.timeoutTimer) {
+      window.clearTimeout(detectorConnection.timeoutTimer);
+      detectorConnection.timeoutTimer = null;
+    }
+  }
+
+  function scheduleHealthCheck() {
+    if (detectorConnection.healthCheckTimer) {
+      window.clearTimeout(detectorConnection.healthCheckTimer);
+    }
+    detectorConnection.healthCheckTimer = window.setTimeout(() => {
+      detectorConnection.healthCheckTimer = null;
+      if (detectorConnection.status !== "connected") return;
+      sendDetectorPing();
+      scheduleHealthCheck();
+    }, DETECTOR_HEALTHCHECK_INTERVAL_MS);
+  }
+
+  function sendDetectorPing() {
+    try {
+      window.postMessage(
+        {
+          channel: CHANNEL,
+          version: 1,
+          type: "detector-ping"
+        },
+        window.location.origin
+      );
+    } catch {
+      // A page navigation may temporarily make postMessage unavailable.
+    }
+  }
+
+  function scheduleDetectorPing(delay = DETECTOR_PING_INTERVAL_MS) {
+    if (detectorConnection.status === "connected") return;
+    if (detectorConnection.pingTimer) {
+      window.clearTimeout(detectorConnection.pingTimer);
+    }
+    detectorConnection.pingTimer = window.setTimeout(() => {
+      detectorConnection.pingTimer = null;
+      if (detectorConnection.status === "connected") return;
+      sendDetectorPing();
+      scheduleDetectorPing(
+        detectorConnection.status === "disconnected"
+          ? DETECTOR_RETRY_INTERVAL_MS
+          : DETECTOR_PING_INTERVAL_MS
+      );
+    }, delay);
+  }
+
+  function startDetectorHandshake() {
+    sendDetectorPing();
+    scheduleDetectorPing();
+    detectorConnection.timeoutTimer = window.setTimeout(() => {
+      detectorConnection.timeoutTimer = null;
+      if (detectorConnection.status === "connected") return;
+      detectorHealth.timeout(detectorConnection);
+      render();
+      // Keep a low-frequency retry alive so a MAIN-world script that was
+      // injected late can still connect without requiring a page reload.
+      scheduleDetectorPing(DETECTOR_RETRY_INTERVAL_MS);
+    }, DETECTOR_CONNECT_TIMEOUT_MS);
+  }
+
+  function acceptDetectorHealth(health) {
+    const normalized = detectorHealth.accept(detectorConnection, health);
+    if (!normalized) return false;
+    stopDetectorPing();
+    scheduleHealthCheck();
+    render();
+    return true;
   }
 
   function clearTurnTimers(turn) {
@@ -400,7 +534,13 @@
   }
 
   function diagnosticSummary(turn) {
-    if (!turn) return "检测器已就绪，等待 ChatGPT 对话请求。";
+    if (!turn) {
+      return detectorConnection.status === "connected"
+        ? "检测器已就绪，等待 ChatGPT 对话请求。"
+        : detectorConnection.status === "disconnected"
+          ? "采集器未连接，暂时无法捕获 ChatGPT 对话请求。"
+          : "正在连接采集器，等待采集桥确认。";
+    }
 
     const stats = turn.responseStats || {};
     const requestState = turn.requestCaptured
@@ -422,6 +562,7 @@
         : "未捕获，等待中";
 
     const parts = [
+      `采集器：${detectorConnectionLabel()}`,
       `请求：${requestState}`,
       `响应：${responseState}`,
       `格式：${responseFormatLabel(turn.responseFormat)}`,
@@ -448,6 +589,13 @@
     const current = turn || {};
     return [
       `扩展版本：${extensionVersion()}`,
+      `采集器状态：${detectorConnectionLabel()}`,
+      `采集器版本：${
+        detectorConnection.health
+          ? detectorConnection.health.detectorVersion
+          : "未确认"
+      }`,
+      `采集器健康：${detectorHealthSummary()}`,
       `状态：${displayStatusLabel(result)}`,
       `判定理由：${result.reason}`,
       `不可用原因：${
@@ -528,13 +676,28 @@
     const turn = currentTurn();
     const result = resultForTurn(turn);
     ui.host.dataset.status = result.status;
-    ui.status.textContent = `${statusIcon(result.status)} ${displayStatusLabel(
-      result
-    )}`;
-    ui.line.textContent = modelLine(result, turn);
-    ui.reason.textContent = result.reason;
+    ui.host.dataset.collector = detectorConnection.status;
+    if (detectorConnection.status === "connecting") {
+      ui.status.textContent = "◌ 正在连接采集器";
+      ui.line.textContent = "等待采集器确认";
+      ui.reason.textContent = "正在等待 MAIN world 采集桥响应。";
+    } else if (detectorConnection.status === "disconnected") {
+      ui.status.textContent = "? 采集器未连接";
+      ui.line.textContent = "暂时无法捕获 ChatGPT 对话请求";
+      ui.reason.textContent =
+        "未收到 MAIN world 采集桥的健康确认，当前轮次无法可靠检测。";
+    } else {
+      ui.status.textContent = `${statusIcon(result.status)} ${displayStatusLabel(
+        result
+      )}`;
+      ui.line.textContent = modelLine(result, turn);
+      ui.reason.textContent = result.reason;
+    }
     ui.diagnostic.textContent = `诊断：${diagnosticSummary(turn)}`;
-    ui.summary.title = result.reason;
+    ui.summary.title =
+      detectorConnection.status === "connected"
+        ? result.reason
+        : ui.reason.textContent;
 
     const fields = [
       [FIELD_LABELS.requestModel, "requestModel", false],
@@ -614,6 +777,11 @@
       data.version !== 1 ||
       typeof data.type !== "string"
     ) {
+      return;
+    }
+
+    if (data.type === "detector-pong" || data.type === "detector-ready") {
+      acceptDetectorHealth(data.health);
       return;
     }
 
@@ -797,5 +965,6 @@
 
   window.addEventListener("message", handleRouteEvent, false);
   mount();
+  startDetectorHandshake();
   window.setTimeout(render, 500);
 })();

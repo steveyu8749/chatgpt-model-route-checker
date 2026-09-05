@@ -15,10 +15,21 @@ const timingSource = fs.readFileSync(
 
 function makeContext(responseText, fetchImpl, options = {}) {
   const messages = [];
+  const listeners = new Map();
   const window = {
     location: {
       origin: "https://chatgpt.com",
       href: "https://chatgpt.com/"
+    },
+    addEventListener(type, callback) {
+      const callbacks = listeners.get(type) || [];
+      callbacks.push(callback);
+      listeners.set(type, callbacks);
+    },
+    dispatchEvent(event) {
+      for (const callback of listeners.get(event.type) || []) {
+        callback.call(window, event);
+      }
     },
     postMessage(message) {
       messages.push(message);
@@ -51,8 +62,15 @@ function makeContext(responseText, fetchImpl, options = {}) {
 
   // Browser globals referenced without `window.` in MAIN-world code.
   context.XMLHttpRequest = options.XMLHttpRequest;
+  window.XMLHttpRequest = options.XMLHttpRequest;
+  window.navigator = context.navigator;
   context.globalThis = context;
-  vm.runInNewContext(timingSource, context, { filename: "timing.js" });
+  if (!options.omitTiming) {
+    vm.runInNewContext(timingSource, context, { filename: "timing.js" });
+  }
+  if (options.timingOverride) {
+    window.ChatGPTRouteTiming = options.timingOverride;
+  }
   vm.runInNewContext(detectorSource, context, { filename: "detector.js" });
   return { window, messages, context };
 }
@@ -121,6 +139,120 @@ test("fetch bridge emits model evidence without forwarding message content", asy
   assert.equal(responseEnd.responseUnsupported, false);
 });
 
+test("missing timing policy uses the six-second fallback and keeps the bridge active", async () => {
+  const responseText = `data: ${JSON.stringify({
+    server_ste_metadata: { model_slug: "gpt-timing-fallback" }
+  })}\n\ndata: [DONE]\n\n`;
+  const { window, messages } = makeContext(responseText, null, {
+    omitTiming: true
+  });
+
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-timing-fallback" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(messages.some((message) => message.type === "request"));
+  assert.ok(messages.some((message) => message.type === "server-model"));
+  assert.ok(messages.some((message) => message.type === "response-end"));
+  assert.equal(
+    messages.find((message) => message.type === "server-model").value,
+    "gpt-timing-fallback"
+  );
+});
+
+test("malformed timing policy falls back without disabling request capture", async () => {
+  const responseText = `data: ${JSON.stringify({
+    server_ste_metadata: { model_slug: "gpt-timing-malformed" }
+  })}\n\ndata: [DONE]\n\n`;
+  const timingOverride = {};
+  Object.defineProperty(timingOverride, "MODEL_METADATA_WAIT_WINDOW_MS", {
+    get() {
+      throw new Error("timing policy unavailable");
+    }
+  });
+  const { window, messages } = makeContext(responseText, null, {
+    timingOverride
+  });
+
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-timing-malformed" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(messages.some((message) => message.type === "request"));
+  assert.ok(messages.some((message) => message.type === "server-model"));
+});
+
+test("a non-six-second timing value is treated as malformed", async () => {
+  const responseText = `data: ${JSON.stringify({
+    server_ste_metadata: { model_slug: "gpt-timing-value" }
+  })}\n\ndata: [DONE]\n\n`;
+  const { window, messages } = makeContext(responseText, null, {
+    timingOverride: { MODEL_METADATA_WAIT_WINDOW_MS: 7000 }
+  });
+
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-timing-value" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.ok(messages.some((message) => message.type === "server-model"));
+});
+
+test("isolated pings receive a bounded detector health response", () => {
+  const { window, messages } = makeContext("{}");
+  window.dispatchEvent({
+    type: "message",
+    source: window,
+    origin: window.location.origin,
+    data: {
+      channel: "__CHATGPT_MODEL_ROUTE_CHECKER_V1__",
+      version: 1,
+      type: "detector-ping"
+    }
+  });
+
+  const pong = messages.find((message) => message.type === "detector-pong");
+  assert.ok(pong);
+  assert.deepEqual(Object.keys(pong.health).sort(), [
+    "beacon",
+    "detectorVersion",
+    "fetch",
+    "xhr"
+  ]);
+  assert.equal(pong.health.detectorVersion, "1.1.3");
+  assert.equal(pong.health.fetch, "installed");
+  assert.equal(pong.health.xhr, "unavailable");
+  assert.equal(pong.health.beacon, "unavailable");
+  assert.doesNotMatch(JSON.stringify(pong), /url|requestId|messages|content|body/i);
+});
+
+test("health reports a later fetch overwrite without rewrapping it", () => {
+  const { window, messages } = makeContext("{}");
+  const replacement = function replacementFetch() {
+    return Promise.resolve(new Response("{}"));
+  };
+  window.fetch = replacement;
+  window.dispatchEvent({
+    type: "message",
+    source: window,
+    origin: window.location.origin,
+    data: {
+      channel: "__CHATGPT_MODEL_ROUTE_CHECKER_V1__",
+      version: 1,
+      type: "detector-ping"
+    }
+  });
+
+  const pong = messages.find((message) => message.type === "detector-pong");
+  assert.equal(pong.health.fetch, "overwritten");
+  assert.equal(window.fetch, replacement);
+});
+
 test("long responses emit throttled progress snapshots without response text", async () => {
   const chunks = [
     `data: ${JSON.stringify({ type: "progress-only", value: "ignored" })}\n\n`,
@@ -177,7 +309,10 @@ test("non-ChatGPT URLs are not intercepted", async () => {
     body: JSON.stringify({ model: "not-captured" })
   });
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.deepEqual(messages, []);
+  assert.deepEqual(
+    messages.filter((message) => message.type !== "detector-ready"),
+    []
+  );
 });
 
 test("a rejected native fetch closes the turn while preserving rejection", async () => {
