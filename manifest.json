@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT 模型路由检测器",
+  "version": "1.0.1",
+  "description": "核对 ChatGPT 浏览器请求模型与服务端公开路由元数据。",
+  "action": {
+    "default_title": "ChatGPT 模型路由检测器"
+  },
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/style.css"],
+      "matches": ["https://chatgpt.com/*"]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content/model-rules.js", "content/verdict.js", "content/content.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content/detector.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
