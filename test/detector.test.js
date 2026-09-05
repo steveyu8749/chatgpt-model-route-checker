@@ -935,3 +935,27 @@ test('XHR progress is reported during transfer and listeners are cleaned at load
   clock.now += 2000; progress();
   assert.equal(messages.filter(m => m.type === 'response-progress').length, count);
 });
+
+test('repeated model evidence is deduplicated while distinct conflicts are retained', async () => {
+  const values = [...Array(100).fill('gpt-a'), 'gpt-b'];
+  const text = values.map(model_slug => `data: ${JSON.stringify({ server_ste_metadata: { model_slug } })}\n\n`).join('');
+  const { window, messages } = makeContext(text);
+  await window.fetch(conversationUrl, requestOptions('gpt-a')); await settle();
+  assert.deepEqual(messages.filter(m => m.type === 'server-model').map(m => m.value), ['gpt-a', 'gpt-b']);
+});
+
+test('synchronous XHR failure cannot leave a loadend listener attached to the next request', async () => {
+  class XHR extends EventTarget {
+    open() {}
+    send() { if (!this.recovered) throw new Error('send failed'); }
+  }
+  const { context, messages } = makeContext('', null, { XMLHttpRequest: XHR });
+  const xhr = new context.XMLHttpRequest();
+  xhr.open('POST', conversationUrl);
+  assert.throws(() => xhr.send('{"model":"gpt-old"}'), /send failed/);
+  const old = messages.find(m => m.type === 'request').requestId;
+  xhr.recovered = true; xhr.open('POST', conversationUrl); xhr.send('{"model":"gpt-new"}');
+  xhr.status = 200; xhr.responseText = '{"server_ste_metadata":{"model_slug":"gpt-new"}}';
+  xhr.dispatchEvent(new Event('loadend')); await settle();
+  assert.equal(messages.some(m => m.type === 'server-model' && m.requestId === old), false);
+});

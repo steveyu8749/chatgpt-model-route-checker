@@ -126,7 +126,8 @@
       endedAt: null,
       responseStarted: false,
       serverModelSeen: false,
-      telemetryEligible: true
+      telemetryEligible: true,
+      emittedValues: new Map()
     });
   }
 
@@ -508,6 +509,16 @@
     if (!targetRequestId) return;
 
     markModelField(targetRequestId, type);
+    const record = conversationRecords.get(targetRequestId);
+    if (record) {
+      let values = record.emittedValues.get(type);
+      if (!values) record.emittedValues.set(type, (values = new Set()));
+      const key = cleaned.toLowerCase();
+      // Forward eight distinct values plus one overflow observation. That
+      // preserves ISOLATED conflict/truncation reporting with bounded memory.
+      if (values.has(key) || values.size >= 9) return;
+      values.add(key);
+    }
 
     emit(type, {
       requestId: targetRequestId,
@@ -1285,11 +1296,10 @@
           if (typeof this.removeEventListener !== "function") return;
           this.removeEventListener("readystatechange", onReadyState);
           this.removeEventListener("progress", onProgress);
+          this.removeEventListener("loadend", onLoadEnd);
         };
 
-        this.addEventListener(
-          "loadend",
-          async () => {
+        const onLoadEnd = async () => {
             cleanupXHR();
             const responseType = (() => {
               try {
@@ -1301,9 +1311,8 @@
             let hasResponse = false;
             try {
               hasResponse = Boolean(
-                this.response ||
-                this.responseText ||
-                this.status >= 200
+                this.status >= 200 || this.response ||
+                ((!responseType || responseType === "text") && this.responseText)
               );
             } catch {
               hasResponse = false;
@@ -1328,9 +1337,8 @@
               // Response may be binary or inaccessible.
               closeConversation(id, { endReason: "read-error" });
             }
-          },
-          { once: true }
-        );
+        };
+        this.addEventListener("loadend", onLoadEnd, { once: true });
       } else if (telemetry) {
         const association = telemetryAssociation();
         bodyToText(body)

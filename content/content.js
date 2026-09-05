@@ -359,26 +359,21 @@
       .join("；");
   }
 
+  function serverValue(turn) {
+    if (!turn) return "未获取";
+    let label = "未获取";
+    if (turn.responseEndReason === "stream-stalled") label = "采集停滞，可恢复";
+    else if (turn.responseUnsupported) label = "响应格式不支持";
+    else if (["read-error", "aborted", "interrupted"].includes(turn.responseEndReason)) label = "响应中断，未获取";
+    else if (turnState.isWaitingForDelayedMetadata(turn)) label = "等待延迟模型元数据…";
+    else if (turn.complete && turn.responseStarted && turn.responseEnded) label = "本轮未观察到标注";
+    else if (!turn.complete) label = turn.responseStarted ? "等待服务端…" : "等待响应…";
+    return formatEvidenceValue(turn, "serverModel", false, true, label);
+  }
+
   function modelLine(result, turn) {
-    if (!turn) {
-      return "发送消息后显示本轮模型";
-    }
-    const delayedMetadataWaiting = turnState.isWaitingForDelayedMetadata(turn);
-    const serverWaiting = turn.responseStarted && !turn.responseEnded;
-    const serverNotPublished = Boolean(
-      turn.complete && turn.responseEnded && !turn.serverModel
-    );
-    return `${formatEvidenceValue(turn, "requestModel")} → ${formatEvidenceValue(
-      turn,
-      "serverModel",
-      false,
-      serverWaiting || delayedMetadataWaiting || serverNotPublished,
-      delayedMetadataWaiting
-        ? "等待延迟模型元数据…"
-        : serverNotPublished
-          ? "本轮暂未公开"
-          : undefined
-    )}`;
+    if (!turn) return "发送消息后显示本轮模型";
+    return `${formatEvidenceValue(turn, "requestModel")} → ${serverValue(turn)}`;
   }
 
   function resultForTurn(turn) {
@@ -428,6 +423,7 @@
     ) {
       valueElement.classList.add("is-optional");
     }
+    row.valueElement = valueElement;
     row.append(labelElement, valueElement);
     return row;
   }
@@ -465,15 +461,15 @@
     const reason = makeElement("p", "route-reason");
     const diagnostic = makeElement("p", "route-diagnostic");
     const fields = makeElement("dl", "route-fields");
-    fields.append(
-      makeField("客户端 request.model", null),
-      makeField("服务端 server_ste_metadata.model_slug", null),
-      makeField("assistant metadata.model_slug", null, true),
-      makeField("resolved_model_slug", null, true),
-      makeField("requested_model_experience", null, true),
-      makeField("DOM data-message-model-slug", null, true),
-      makeField("request.thinking_effort", null, true)
-    );
+    const fieldRows = new Map();
+    for (const [field, label] of Object.entries(FIELD_LABELS)) {
+      const optional = field !== "requestModel" && field !== "serverModel";
+      const row = makeField(label, null, optional);
+      fieldRows.set(field, row);
+      fields.append(row);
+    }
+    const warning = makeElement("p", "route-warning");
+    warning.hidden = true;
 
     const footer = makeElement("div", "route-footer");
     const note = makeElement(
@@ -486,7 +482,7 @@
     footer.append(note, copy);
 
     details.append(reason, diagnostic, fields, footer);
-    card.append(summary, details);
+    card.append(summary, warning, details);
     shadow.appendChild(card);
 
     summary.addEventListener("click", () => {
@@ -494,6 +490,7 @@
       details.hidden = !expanded;
       summary.setAttribute("aria-expanded", String(expanded));
       host.classList.toggle("is-expanded", expanded);
+      render();
     });
 
     copy.addEventListener("click", async (event) => {
@@ -518,6 +515,8 @@
       reason,
       diagnostic,
       fields,
+      fieldRows,
+      warning,
       copy
     };
   }
@@ -678,22 +677,7 @@
         turn,
         "requestModel"
       )}`,
-      `${FIELD_LABELS.serverModel}：${formatEvidenceValue(
-        turn,
-        "serverModel",
-        false,
-        turnState.isWaitingForDelayedMetadata(turn) ||
-          Boolean(
-            turn &&
-            turn.complete &&
-            turn.responseStarted &&
-            turn.responseEnded &&
-            !turn.serverModel
-          ),
-        turnState.isWaitingForDelayedMetadata(turn)
-          ? "等待延迟模型元数据…"
-          : "本轮暂未公开"
-      )}`,
+      `${FIELD_LABELS.serverModel}：${serverValue(turn)}`,
       `${FIELD_LABELS.assistantModel}：${formatEvidenceValue(
         turn,
         "assistantModel",
@@ -750,7 +734,30 @@
     }
   }
 
+  let renderFrame = null;
+  let renderFallback = null;
   function render() {
+    if (!ui || renderFallback !== null) return;
+    const flush = () => {
+      if (renderFallback === null) return;
+      window.clearTimeout(renderFallback);
+      renderFallback = null;
+      if (renderFrame !== null) window.cancelAnimationFrame(renderFrame);
+      renderFrame = null;
+      renderNow();
+    };
+    // requestAnimationFrame can pause in hidden tabs; bound UI staleness too.
+    renderFallback = window.setTimeout(flush, 100);
+    if (typeof window.requestAnimationFrame === "function") {
+      renderFrame = window.requestAnimationFrame(flush);
+    }
+  }
+
+  function setText(node, value) {
+    if (node.textContent !== value) node.textContent = value;
+  }
+
+  function renderNow() {
     if (!ui) return;
 
     const turn = currentTurn();
@@ -758,65 +765,43 @@
     ui.host.dataset.status = result.status;
     ui.host.dataset.collector = detectorConnection.status;
     if (detectorConnection.status === "connecting") {
-      ui.status.textContent = "◌ 正在连接采集器";
-      ui.line.textContent = "等待采集器确认";
-      ui.reason.textContent = "正在等待 MAIN world 采集桥响应。";
+      setText(ui.status, "◌ 正在连接采集器");
+      setText(ui.line, "等待采集器确认");
+      setText(ui.reason, "正在等待 MAIN world 采集桥响应。");
     } else if (detectorConnection.status === "disconnected") {
-      ui.status.textContent = "? 采集器未连接";
-      ui.line.textContent = "暂时无法捕获 ChatGPT 对话请求";
-      ui.reason.textContent =
-        "未收到 MAIN world 采集桥的健康确认，当前轮次无法可靠检测。";
+      setText(ui.status, "? 采集器未连接");
+      setText(ui.line, "暂时无法捕获 ChatGPT 对话请求");
+      setText(ui.reason, "未收到 MAIN world 采集桥的健康确认，当前轮次无法可靠检测。");
     } else {
-      ui.status.textContent = `${statusIcon(result.status)} ${displayStatusLabel(
+      setText(ui.status, `${statusIcon(result.status)} ${displayStatusLabel(
         result
-      )}`;
-      ui.line.textContent = modelLine(result, turn);
-      ui.reason.textContent = result.reason;
+      )}`);
+      setText(ui.line, modelLine(result, turn));
+      setText(ui.reason, result.reason);
     }
-    ui.diagnostic.textContent = `诊断：${diagnosticSummary(turn)}`;
+    setText(ui.diagnostic, `诊断：${diagnosticSummary(turn)}`);
     ui.summary.title =
       detectorConnection.status === "connected"
         ? result.reason
         : ui.reason.textContent;
 
-    const fields = [
-      [FIELD_LABELS.requestModel, "requestModel", false],
-      [FIELD_LABELS.serverModel, "serverModel", false],
-      [FIELD_LABELS.assistantModel, "assistantModel", true],
-      [FIELD_LABELS.resolvedModel, "resolvedModel", true],
-      [FIELD_LABELS.requestedExperience, "requestedExperience", true],
-      [FIELD_LABELS.domModel, "domModel", true],
-      [FIELD_LABELS.thinkingEffort, "thinkingEffort", true]
-    ];
-
-    ui.fields.replaceChildren(
-      ...fields.map(([label, field, optional]) =>
-        makeField(
-          label,
-          turn
-            ? formatEvidenceValue(
-                turn,
-                field,
-                optional,
-                field === "serverModel" &&
-                  (turnState.isWaitingForDelayedMetadata(turn) ||
-                    Boolean(
-                      turn.complete &&
-                      turn.responseStarted &&
-                      turn.responseEnded &&
-                      !turn.serverModel
-                    )),
-                field === "serverModel"
-                  ? turnState.isWaitingForDelayedMetadata(turn)
-                    ? "等待延迟模型元数据…"
-                    : "本轮暂未公开"
-                  : undefined
-              )
-            : null,
-          optional
-        )
-      )
+    const health = detectorConnection.health;
+    const impaired = health && ["fetch", "xhr", "beacon"].filter(key =>
+      health[key] === "failed" || health[key] === "overwritten"
     );
+    ui.warning.hidden = detectorConnection.status !== "connected" || !impaired?.length;
+    if (!ui.warning.hidden) {
+      setText(ui.warning, `部分采集不可用（${impaired.join("、")}），结果可能不完整。刷新页面后重试。`);
+    }
+    // Collapsing the panel only defers detail rendering, never collection.
+    if (!expanded) return;
+    for (const [field, row] of ui.fieldRows) {
+      const optional = field !== "requestModel" && field !== "serverModel";
+      const value = field === "serverModel" ? serverValue(turn)
+        : formatEvidenceValue(turn, field, optional);
+      setText(row.valueElement, value);
+      row.valueElement.classList.toggle("is-optional", optional && value === "未提供（可选）");
+    }
   }
 
   function displayStatusLabel(result) {
@@ -1022,13 +1007,11 @@
   function maybeReadDomModel(node, source = "attribute") {
     const turn = currentTurn();
     if (!turnState.shouldAcceptDomEvidence(turn, node, source)) return;
-    if (node !== lastAssistantNode()) return;
-
     const value = clean(node.getAttribute("data-message-model-slug"));
-    if (!value) return;
+    if (!value || node !== lastAssistantNode()) return;
 
-    turnState.addEvidence(turn, "domModel", value);
-    render();
+    const change = turnState.addEvidence(turn, "domModel", value);
+    if (change.added) render();
   }
 
   function inspectAddedNode(node) {

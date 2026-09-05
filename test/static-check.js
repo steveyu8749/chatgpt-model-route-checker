@@ -105,7 +105,7 @@ assert.match(content, /detector-pong/);
 assert.match(content, /detector-ready/);
 assert.match(content, /采集器健康/);
 assert.match(content, /telemetrySummary/);
-assert.match(content, /本轮暂未公开/);
+assert.match(content, /本轮未观察到标注/);
 assert.doesNotMatch(content, /2500/);
 assert.match(content, /evidenceConflictSummary/);
 assert.match(content, /getManifest\(\)\.version/);
@@ -142,7 +142,7 @@ assert.match(readme, /诊断摘要/);
 assert.match(readme, /不能证明 OpenAI GPU/);
 assert.match(readme, /当前版本：`1\.1\.4`/);
 assert.match(readme, /1\.1\.4/);
-assert.match(readme, /71 项行为测试/);
+assert.match(readme, /78 项行为测试/);
 assert.doesNotMatch(readme, /未捕获请求/);
 
 console.log("Static extension checks passed.");
