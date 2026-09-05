@@ -74,6 +74,12 @@
       evidenceConflicts: evidenceConflicts(),
       evidenceTruncated: evidenceTruncated(),
       complete: false,
+      roundNumber: null,
+      requestCapturedAt: null,
+      responseStartedAt: null,
+      responseEndedAt: null,
+      serverModelAt: null,
+      completedAt: null,
       responseStarted: false,
       responseEnded: false,
       responseEndReason: null,
@@ -149,6 +155,9 @@
     // bounded evidenceValues list and can therefore never silently overwrite
     // the earlier value.
     if (!turn[field] && values.length) turn[field] = values[0];
+    if (added && !Number.isFinite(turn[`${field}At`])) {
+      turn[`${field}At`] = now;
+    }
     turn.evidenceConflicts[field] = values.length > 1;
     touch(turn, now);
 
@@ -193,6 +202,7 @@
 
   function captureRequest(turn, fields = {}, now = Date.now()) {
     if (!turn) return null;
+    if (!Number.isFinite(turn.requestCapturedAt)) turn.requestCapturedAt = now;
     turn.requestCaptured = true;
     addEvidence(turn, "requestModel", fields.model, now);
     addEvidence(turn, "thinkingEffort", fields.thinkingEffort, now);
@@ -203,6 +213,7 @@
   function startResponse(turn, responseFormat, now = Date.now()) {
     if (!turn) return null;
     touch(turn, now);
+    if (!Number.isFinite(turn.responseStartedAt)) turn.responseStartedAt = now;
     turn.responseStarted = true;
     turn.responseFormat = clean(responseFormat, 40) || "unknown";
     turn.responseEnded = false;
@@ -232,6 +243,7 @@
 
   function endResponse(turn, details = {}, now = Date.now()) {
     if (!turn) return null;
+    if (!Number.isFinite(turn.responseEndedAt)) turn.responseEndedAt = now;
     turn.responseEnded = true;
     turn.responseEndReason = clean(details.endReason, 80) || "completed";
     if (details.responseStarted !== undefined) {
@@ -247,6 +259,7 @@
 
   function complete(turn, now = Date.now()) {
     if (!turn) return null;
+    if (!Number.isFinite(turn.completedAt)) turn.completedAt = now;
     turn.complete = true;
     touch(turn, now);
     return turn;
@@ -254,11 +267,107 @@
 
   function timeout(turn, reason = "no-response", now = Date.now()) {
     if (!turn) return null;
+    if (!Number.isFinite(turn.responseEndedAt)) turn.responseEndedAt = now;
     turn.responseEnded = true;
     turn.responseEndReason = clean(reason, 80) || "no-response";
     turn.complete = true;
+    if (!Number.isFinite(turn.completedAt)) turn.completedAt = now;
     touch(turn, now);
     return turn;
+  }
+
+  function isWaitingForDelayedMetadata(turn) {
+    return Boolean(
+      turn &&
+      turn.responseEnded &&
+      !turn.complete &&
+      !turn.serverModel
+    );
+  }
+
+  function delayedMetadataState(
+    turn,
+    now = Date.now(),
+    waitWindowMs
+  ) {
+    const windowMs = Number.isFinite(waitWindowMs)
+      ? Math.max(0, Math.floor(waitWindowMs))
+      : null;
+    const responseEndedAt = turn && turn.responseEndedAt;
+    const waiting = isWaitingForDelayedMetadata(turn);
+    if (
+      !waiting ||
+      !Number.isFinite(now) ||
+      !Number.isFinite(responseEndedAt) ||
+      windowMs === null
+    ) {
+      return {
+        waiting: false,
+        expired: false,
+        elapsedMs: null,
+        remainingMs: null
+      };
+    }
+
+    const elapsedMs = Math.max(0, Math.floor(now - responseEndedAt));
+    return {
+      waiting: true,
+      expired: elapsedMs >= windowMs,
+      elapsedMs,
+      remainingMs: Math.max(0, windowMs - elapsedMs)
+    };
+  }
+
+  function elapsedSince(start, end) {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+    return Math.max(0, Math.floor(end - start));
+  }
+
+  function relativeTiming(turn, now = Date.now()) {
+    if (!turn) {
+      return {
+        roundNumber: null,
+        requestToResponseStartMs: null,
+        requestToResponseEndMs: null,
+        responseEndToServerModelMs: null,
+        responseEndElapsedMs: null,
+        totalElapsedMs: null,
+        settled: false
+      };
+    }
+
+    const currentTime = Number.isFinite(now) ? now : Date.now();
+    const requestAt = Number.isFinite(turn.requestCapturedAt)
+      ? turn.requestCapturedAt
+      : turn.startedAt;
+    const responseEndToServerModelMs =
+      Number.isFinite(turn.responseEndedAt) &&
+      Number.isFinite(turn.serverModelAt)
+        ? Math.floor(turn.serverModelAt - turn.responseEndedAt)
+        : null;
+    const settledAt = Number.isFinite(turn.serverModelAt)
+      ? turn.serverModelAt
+      : Number.isFinite(turn.completedAt)
+        ? turn.completedAt
+        : null;
+    const timingEnd = Number.isFinite(settledAt) ? settledAt : currentTime;
+
+    return {
+      roundNumber: Number.isFinite(turn.roundNumber)
+        ? turn.roundNumber
+        : null,
+      requestToResponseStartMs: elapsedSince(
+        requestAt,
+        turn.responseStartedAt
+      ),
+      requestToResponseEndMs: elapsedSince(requestAt, turn.responseEndedAt),
+      responseEndToServerModelMs,
+      responseEndElapsedMs: Number.isFinite(turn.responseEndedAt)
+        ? elapsedSince(turn.responseEndedAt, timingEnd)
+        : null,
+      totalElapsedMs: elapsedSince(requestAt, timingEnd),
+      settled: Number.isFinite(settledAt)
+    };
   }
 
   function createStore(options = {}) {
@@ -269,6 +378,7 @@
     const onEvict = typeof options.onEvict === "function" ? options.onEvict : () => {};
     const turns = new Map();
     let currentId = null;
+    let nextRoundNumber = 1;
 
     function get(id, create = true) {
       if (!id) return null;
@@ -292,6 +402,10 @@
       const existing = turns.has(id);
       const turn = get(id, true);
       const hadRequest = Boolean(turn && turn.requestCaptured);
+      if (turn && !Number.isFinite(turn.roundNumber)) {
+        turn.roundNumber = nextRoundNumber;
+        nextRoundNumber += 1;
+      }
       captureRequest(turn, fields, now());
       const previousCurrentId = currentId;
       // A newly observed request becomes the visible turn. A duplicate event
@@ -346,6 +460,9 @@
     endResponse,
     complete,
     timeout,
+    isWaitingForDelayedMetadata,
+    delayedMetadataState,
+    relativeTiming,
     createStore
   });
 });

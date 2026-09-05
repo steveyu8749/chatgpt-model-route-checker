@@ -15,7 +15,9 @@
   const MAX_SCAN_DEPTH = 18;
   const MAX_SCAN_NODES = 12000;
   const STREAM_BUFFER_LIMIT = 2 * 1024 * 1024;
-  const TELEMETRY_ASSOCIATION_WINDOW_MS = 6000;
+  const timing = window.ChatGPTRouteTiming;
+  const MODEL_METADATA_WAIT_WINDOW_MS =
+    timing && timing.MODEL_METADATA_WAIT_WINDOW_MS;
   const ACTIVE_RECORD_RETENTION_MS = 5 * 60 * 1000;
   const ENDED_RECORD_RETENTION_MS = 15000;
   const RESPONSE_PROGRESS_INTERVAL_MS = 1000;
@@ -31,6 +33,7 @@
   ]);
   const stateKey = "__CHATGPT_MODEL_ROUTE_CHECKER_MAIN_V1__";
 
+  if (!Number.isFinite(MODEL_METADATA_WAIT_WINDOW_MS)) return;
   if (window[stateKey]) return;
   window[stateKey] = true;
 
@@ -132,7 +135,7 @@
       const referenceTime =
         record.endedAt || record.lastActivityAt || record.startedAt;
       const window = record.endedAt
-        ? TELEMETRY_ASSOCIATION_WINDOW_MS
+        ? MODEL_METADATA_WAIT_WINDOW_MS
         : ACTIVE_RECORD_RETENTION_MS;
       return now - referenceTime <= window;
     });

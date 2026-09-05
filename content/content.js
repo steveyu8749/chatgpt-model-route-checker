@@ -6,7 +6,9 @@
   const HOST_ID = "__chatgpt_model_route_checker_host__";
   const MAX_TURNS = 8;
   const RESPONSE_WAIT_TIMEOUT_MS = 30000;
-  const RESPONSE_END_GRACE_MS = 2500;
+  const timing = window.ChatGPTRouteTiming;
+  const MODEL_METADATA_WAIT_WINDOW_MS =
+    timing && timing.MODEL_METADATA_WAIT_WINDOW_MS;
   const NETWORK_EVIDENCE_TYPES = new Set([
     "response-start",
     "response-progress",
@@ -24,7 +26,12 @@
     incompatible: []
   };
 
-  if (!api || !turnState || document.getElementById(HOST_ID)) return;
+  if (
+    !api ||
+    !turnState ||
+    !Number.isFinite(MODEL_METADATA_WAIT_WINDOW_MS) ||
+    document.getElementById(HOST_ID)
+  ) return;
 
   let expanded = false;
   let ui = null;
@@ -58,14 +65,48 @@
     if (!turn || turn.complete) return;
     if (turn.completionTimer) window.clearTimeout(turn.completionTimer);
 
+    // A server model that arrived before response-end already settles the
+    // model check; no delayed-metadata timer is needed in that case.
+    if (turn.serverModel) {
+      turnState.complete(turn);
+      return;
+    }
+
     // Telemetry can carry the same route metadata shortly after the
     // conversation stream closes. Keep the turn in a neutral checking state
-    // during this short grace period so "无法检测" does not flash early.
+    // during the shared metadata window so "无法检测" does not flash early.
+    const waitState = turnState.delayedMetadataState(
+      turn,
+      Date.now(),
+      MODEL_METADATA_WAIT_WINDOW_MS
+    );
+    const delay = waitState.waiting && Number.isFinite(waitState.remainingMs)
+      ? waitState.remainingMs
+      : MODEL_METADATA_WAIT_WINDOW_MS;
+
     turn.completionTimer = window.setTimeout(() => {
       turn.completionTimer = null;
+      if (turn.serverModel) {
+        turnState.complete(turn);
+        if (turnStore.isCurrent(turn.id)) render();
+        return;
+      }
+
+      // Timers are best-effort and may run before their requested delay in a
+      // test harness or after a clock adjustment. Re-check the pure lifecycle
+      // state so the full shared window is honored before finalizing.
+      const currentWaitState = turnState.delayedMetadataState(
+        turn,
+        Date.now(),
+        MODEL_METADATA_WAIT_WINDOW_MS
+      );
+      if (currentWaitState.waiting && !currentWaitState.expired) {
+        scheduleCompletion(turn);
+        return;
+      }
       turnState.complete(turn);
       if (turnStore.isCurrent(turn.id)) render();
-    }, RESPONSE_END_GRACE_MS);
+    }, delay);
   }
 
   function scheduleResponseWait(turn) {
@@ -79,9 +120,14 @@
     }, RESPONSE_WAIT_TIMEOUT_MS);
   }
 
-  function displayValue(value, waiting = false, optional = false) {
+  function displayValue(
+    value,
+    waiting = false,
+    optional = false,
+    waitingLabel = "等待服务端…"
+  ) {
     if (value) return value;
-    return waiting ? "等待服务端…" : optional ? "未提供（可选）" : "未获取";
+    return waiting ? waitingLabel : optional ? "未提供（可选）" : "未获取";
   }
 
   const FIELD_LABELS = Object.freeze({
@@ -102,11 +148,12 @@
     turn,
     field,
     optional = false,
-    waiting = false
+    waiting = false,
+    waitingLabel
   ) {
     const values = evidenceValues(turn, field);
     if (values.length > 1) return `${values.join(" / ")}（冲突）`;
-    return displayValue(values[0], waiting, optional);
+    return displayValue(values[0], waiting, optional, waitingLabel);
   }
 
   function evidenceConflictSummary(turn) {
@@ -121,12 +168,14 @@
     if (!turn) {
       return "发送消息后显示本轮模型";
     }
+    const delayedMetadataWaiting = turnState.isWaitingForDelayedMetadata(turn);
     const serverWaiting = turn.responseStarted && !turn.responseEnded;
     return `${formatEvidenceValue(turn, "requestModel")} → ${formatEvidenceValue(
       turn,
       "serverModel",
       false,
-      serverWaiting
+      serverWaiting || delayedMetadataWaiting,
+      delayedMetadataWaiting ? "等待延迟模型元数据…" : undefined
     )}`;
   }
 
@@ -298,6 +347,58 @@
     return labels[format] || "未知";
   }
 
+  function durationLabel(value, signed = false) {
+    if (!Number.isFinite(value)) return "未记录";
+    const rounded = Math.floor(value);
+    const prefix = signed && rounded >= 0 ? "+" : "";
+    return `${prefix}${rounded} ms`;
+  }
+
+  function timingSummary(turn) {
+    if (!turn) return "本地轮次：未知";
+
+    const timing = turnState.relativeTiming(turn);
+    const round = Number.isFinite(timing.roundNumber)
+      ? `#${timing.roundNumber}`
+      : "未知";
+    const parts = [`本地轮次：${round}`];
+
+    if (Number.isFinite(timing.requestToResponseStartMs)) {
+      parts.push(
+        `请求→响应开始：${durationLabel(timing.requestToResponseStartMs)}`
+      );
+    }
+    if (Number.isFinite(timing.requestToResponseEndMs)) {
+      parts.push(
+        `请求→响应结束：${durationLabel(timing.requestToResponseEndMs)}`
+      );
+    }
+    if (Number.isFinite(timing.responseEndToServerModelMs)) {
+      parts.push(
+        `响应结束→服务端模型：${durationLabel(
+          timing.responseEndToServerModelMs,
+          true
+        )}`
+      );
+    } else if (Number.isFinite(timing.responseEndElapsedMs)) {
+      parts.push(
+        timing.settled
+          ? `响应结束→完成判定：${durationLabel(
+              timing.responseEndElapsedMs
+            )}`
+          : `响应结束后已等待：${durationLabel(
+              timing.responseEndElapsedMs
+            )}`
+      );
+    }
+    parts.push(
+      `${timing.settled ? "检测结论耗时" : "当前轮次已耗时"}：${durationLabel(
+        timing.totalElapsedMs
+      )}`
+    );
+    return parts.join("；");
+  }
+
   function diagnosticSummary(turn) {
     if (!turn) return "检测器已就绪，等待 ChatGPT 对话请求。";
 
@@ -307,9 +408,14 @@
         ? "已捕获，模型已获取"
         : "已捕获，模型未获取"
       : "未捕获";
+    const delayedMetadataWaiting = turnState.isWaitingForDelayedMetadata(turn);
     const responseState = turn.responseStarted
       ? turn.responseEnded
-        ? `已捕获，${responseReasonLabel(turn.responseEndReason)}`
+        ? delayedMetadataWaiting
+          ? `已捕获，${responseReasonLabel(
+              turn.responseEndReason
+            )}，等待延迟模型元数据`
+          : `已捕获，${responseReasonLabel(turn.responseEndReason)}`
         : "已捕获，仍在接收"
       : turn.responseEnded
         ? `未捕获，${responseReasonLabel(turn.responseEndReason)}`
@@ -348,13 +454,17 @@
         result.unavailableReason || "不适用"
       }`,
       `诊断摘要：${diagnosticSummary(turn)}`,
+      `本地时序：${timingSummary(turn)}`,
       `${FIELD_LABELS.requestModel}：${formatEvidenceValue(
         turn,
         "requestModel"
       )}`,
       `${FIELD_LABELS.serverModel}：${formatEvidenceValue(
         turn,
-        "serverModel"
+        "serverModel",
+        false,
+        turnState.isWaitingForDelayedMetadata(turn),
+        "等待延迟模型元数据…"
       )}`,
       `${FIELD_LABELS.assistantModel}：${formatEvidenceValue(
         turn,
@@ -440,7 +550,18 @@
       ...fields.map(([label, field, optional]) =>
         makeField(
           label,
-          turn ? formatEvidenceValue(turn, field, optional) : null,
+          turn
+            ? formatEvidenceValue(
+                turn,
+                field,
+                optional,
+                field === "serverModel" &&
+                  turnState.isWaitingForDelayedMetadata(turn),
+                field === "serverModel"
+                  ? "等待延迟模型元数据…"
+                  : undefined
+              )
+            : null,
           optional
         )
       )
@@ -558,6 +679,16 @@
         break;
       case "server-model":
         turnState.addEvidence(turn, "serverModel", value);
+        // A delayed server field settles a completed response immediately.
+        // This keeps the visible state checking only until the evidence is
+        // actually available and cancels the remaining grace timer.
+        if (turn.serverModel && turn.responseEnded && !turn.complete) {
+          if (turn.completionTimer) {
+            window.clearTimeout(turn.completionTimer);
+            turn.completionTimer = null;
+          }
+          turnState.complete(turn);
+        }
         break;
       case "assistant-model":
         turnState.addEvidence(turn, "assistantModel", value);

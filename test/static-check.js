@@ -21,6 +21,10 @@ const turnState = fs.readFileSync(
   path.join(root, "content", "turn-state.js"),
   "utf8"
 );
+const timingSource = fs.readFileSync(
+  path.join(root, "content", "timing.js"),
+  "utf8"
+);
 const rules = fs.readFileSync(
   path.join(root, "content", "model-rules.js"),
   "utf8"
@@ -28,11 +32,13 @@ const rules = fs.readFileSync(
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 
 assert.equal(manifest.manifest_version, 3);
-assert.equal(manifest.version, "1.1.1");
-assert.equal(packageJson.version, "1.1.1");
+assert.equal(manifest.version, "1.1.2");
+assert.equal(packageJson.version, "1.1.2");
 assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"]);
 assert.equal(manifest.content_scripts.length, 2);
 assert.ok(manifest.content_scripts[0].js.includes("content/turn-state.js"));
+assert.ok(manifest.content_scripts[0].js.includes("content/timing.js"));
+assert.ok(manifest.content_scripts[1].js.includes("content/timing.js"));
 assert.deepEqual(manifest.web_accessible_resources, [
   {
     resources: ["content/style.css"],
@@ -51,7 +57,9 @@ assert.match(detector, /window\.fetch/);
 assert.match(detector, /XMLHttpRequest/);
 assert.match(detector, /server_ste_metadata/);
 assert.match(detector, /window\.postMessage/);
-assert.match(detector, /TELEMETRY_ASSOCIATION_WINDOW_MS/);
+assert.match(detector, /ChatGPTRouteTiming/);
+assert.match(detector, /MODEL_METADATA_WAIT_WINDOW_MS/);
+assert.doesNotMatch(detector, /6000/);
 assert.match(detector, /response-start/);
 assert.match(detector, /response-progress/);
 assert.match(detector, /RESPONSE_PROGRESS_INTERVAL_MS/);
@@ -70,11 +78,15 @@ assert.doesNotMatch(detector, /localStorage/);
 assert.doesNotMatch(content, /chrome\.storage/);
 assert.match(content, /NETWORK_EVIDENCE_TYPES/);
 assert.match(content, /ChatGPTRouteTurnState/);
+assert.match(content, /ChatGPTRouteTiming/);
+assert.match(content, /MODEL_METADATA_WAIT_WINDOW_MS/);
+assert.doesNotMatch(content, /2500/);
 assert.match(content, /evidenceConflictSummary/);
 assert.match(content, /getManifest\(\)\.version/);
 assert.match(content, /RESPONSE_WAIT_TIMEOUT_MS/);
 assert.match(content, /NETWORK_EVIDENCE_TYPES\.has\(data\.type\) && !eventId/);
-assert.match(content, /RESPONSE_END_GRACE_MS/);
+assert.match(content, /等待延迟模型元数据/);
+assert.match(content, /timingSummary/);
 assert.match(content, /diagnosticSummary/);
 assert.match(content, /复制诊断/);
 assert.match(content, /UNAVAILABLE_LABELS/);
@@ -86,13 +98,17 @@ assert.match(content, /getURL\("content\/style\.css"\)/);
 assert.match(turnState, /createStore/);
 assert.match(turnState, /MAX_EVIDENCE_VALUES/);
 assert.match(turnState, /lastActivityAt/);
+assert.match(turnState, /delayedMetadataState/);
+assert.match(turnState, /relativeTiming/);
 assert.match(rules, /equivalent: Object\.freeze\(\[\]\)/);
 assert.match(rules, /incompatible: Object\.freeze\(\[\]\)/);
+assert.match(timingSource, /MODEL_METADATA_WAIT_WINDOW_MS = 6000/);
 assert.match(readme, /不上传/);
 assert.match(readme, /未捕获响应/);
 assert.match(readme, /诊断摘要/);
 assert.match(readme, /不能证明 OpenAI GPU/);
-assert.match(readme, /当前版本：`1\.1\.1`/);
+assert.match(readme, /当前版本：`1\.1\.2`/);
+assert.match(readme, /1\.1\.2/);
 assert.doesNotMatch(readme, /未捕获请求/);
 
 console.log("Static extension checks passed.");

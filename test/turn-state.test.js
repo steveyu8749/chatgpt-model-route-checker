@@ -3,6 +3,32 @@ const assert = require("node:assert/strict");
 
 const turnState = require("../content/turn-state.js");
 const verdict = require("../content/verdict.js");
+const timing = require("../content/timing.js");
+
+function classifyTurn(turn) {
+  return verdict.classify({
+    requestModel: turn.requestModel,
+    serverModel: turn.serverModel,
+    assistantModel: turn.assistantModel,
+    resolvedModel: turn.resolvedModel,
+    requestedExperience: turn.requestedExperience,
+    domModel: turn.domModel,
+    thinkingEffort: turn.thinkingEffort,
+    requestCaptured: turn.requestCaptured,
+    responseStarted: turn.responseStarted,
+    responseEnded: turn.responseEnded,
+    responseEndReason: turn.responseEndReason,
+    responseFormat: turn.responseFormat,
+    responseUnsupported: turn.responseUnsupported,
+    complete: turn.complete,
+    evidenceValues: turn.evidenceValues,
+    evidenceConflicts: turn.evidenceConflicts
+  });
+}
+
+test("the shared metadata window is a single six-second policy", () => {
+  assert.equal(timing.MODEL_METADATA_WAIT_WINDOW_MS, 6000);
+});
 
 test("a new request becomes current while its duplicate cannot steal a newer turn", () => {
   const store = turnState.createStore({ maxTurns: 4, now: () => 1000 });
@@ -24,12 +50,129 @@ test("late evidence updates its old turn without changing the current turn", () 
   store.beginRequest("second", { model: "model-second" });
 
   const oldTurn = store.get("first");
-  turnState.addEvidence(oldTurn, "serverModel", "model-first");
+  turnState.startResponse(oldTurn, "sse", 1100);
+  turnState.endResponse(
+    oldTurn,
+    { endReason: "completed", responseStarted: true },
+    2000
+  );
+  // This models telemetry arriving well after response-end for the old
+  // request while a newer request is already the visible card.
+  turnState.addEvidence(oldTurn, "serverModel", "model-first", 5000);
 
   assert.equal(store.currentId(), "second");
   assert.equal(store.current().id, "second");
+  assert.equal(store.get("first").roundNumber, 1);
+  assert.equal(store.get("second").roundNumber, 2);
   assert.equal(oldTurn.serverModel, "model-first");
+  assert.equal(turnState.relativeTiming(oldTurn, 5000).responseEndToServerModelMs, 3000);
   assert.equal(store.isCurrent("first"), false);
+});
+
+test("a response ending at 2.5 seconds is still checking for delayed metadata", () => {
+  const turn = turnState.createTurn("turn-1", 1000);
+  turnState.captureRequest(turn, { model: "gpt-waiting" }, 1000);
+  turnState.startResponse(turn, "sse", 1100);
+  turnState.endResponse(
+    turn,
+    { endReason: "completed", responseStarted: true },
+    2000
+  );
+
+  const state = turnState.delayedMetadataState(
+    turn,
+    4500,
+    timing.MODEL_METADATA_WAIT_WINDOW_MS
+  );
+  const result = classifyTurn(turn);
+
+  assert.equal(state.waiting, true);
+  assert.equal(state.expired, false);
+  assert.equal(state.elapsedMs, 2500);
+  assert.equal(result.status, verdict.STATUS.CHECKING);
+  assert.match(result.reason, /等待延迟模型元数据/);
+});
+
+test("a server model arriving between 2.5 and 6 seconds immediately matches", () => {
+  const turn = turnState.createTurn("turn-1", 1000);
+  turnState.captureRequest(turn, { model: "gpt-late" }, 1000);
+  turnState.startResponse(turn, "sse", 1100);
+  turnState.endResponse(
+    turn,
+    { endReason: "completed", responseStarted: true },
+    2000
+  );
+
+  const before = turnState.delayedMetadataState(
+    turn,
+    4500,
+    timing.MODEL_METADATA_WAIT_WINDOW_MS
+  );
+  assert.equal(before.waiting, true);
+  assert.equal(before.expired, false);
+
+  turnState.addEvidence(turn, "serverModel", "gpt-late", 5000);
+  const result = classifyTurn(turn);
+  const after = turnState.delayedMetadataState(
+    turn,
+    5000,
+    timing.MODEL_METADATA_WAIT_WINDOW_MS
+  );
+  const relative = turnState.relativeTiming(turn, 5000);
+
+  assert.equal(result.status, verdict.STATUS.MATCH);
+  assert.equal(after.waiting, false);
+  assert.equal(relative.responseEndToServerModelMs, 3000);
+  assert.equal(relative.totalElapsedMs, 4000);
+  assert.equal(relative.settled, true);
+});
+
+test("missing server metadata becomes unavailable only after the full window", () => {
+  const turn = turnState.createTurn("turn-1", 1000);
+  turnState.captureRequest(turn, { model: "gpt-timeout" }, 1000);
+  turnState.startResponse(turn, "sse", 1100);
+  turnState.endResponse(
+    turn,
+    { endReason: "completed", responseStarted: true },
+    2000
+  );
+
+  const state = turnState.delayedMetadataState(
+    turn,
+    8000,
+    timing.MODEL_METADATA_WAIT_WINDOW_MS
+  );
+  assert.equal(state.waiting, true);
+  assert.equal(state.expired, true);
+  assert.equal(state.elapsedMs, timing.MODEL_METADATA_WAIT_WINDOW_MS);
+
+  turnState.complete(turn, 8000);
+  const result = classifyTurn(turn);
+  const relative = turnState.relativeTiming(turn, 20000);
+  assert.equal(result.status, verdict.STATUS.UNAVAILABLE);
+  assert.equal(
+    result.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS
+  );
+  assert.equal(relative.responseEndElapsedMs, 6000);
+  assert.equal(relative.totalElapsedMs, 7000);
+  assert.equal(relative.settled, true);
+});
+
+test("an unsettled turn reports elapsed time only up to the observation point", () => {
+  const turn = turnState.createTurn("turn-1", 1000);
+  turnState.captureRequest(turn, { model: "gpt-waiting" }, 1000);
+  turnState.startResponse(turn, "json", 1200);
+  turnState.endResponse(
+    turn,
+    { endReason: "completed", responseStarted: true },
+    2000
+  );
+
+  const relative = turnState.relativeTiming(turn, 4500);
+  assert.equal(relative.responseEndElapsedMs, 2500);
+  assert.equal(relative.totalElapsedMs, 3500);
+  assert.equal(relative.settled, false);
 });
 
 test("repeated identical evidence is deduplicated, while a different value is retained as a conflict", () => {

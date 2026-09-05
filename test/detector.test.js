@@ -8,6 +8,10 @@ const detectorSource = fs.readFileSync(
   path.join(__dirname, "..", "content", "detector.js"),
   "utf8"
 );
+const timingSource = fs.readFileSync(
+  path.join(__dirname, "..", "content", "timing.js"),
+  "utf8"
+);
 
 function makeContext(responseText, fetchImpl, options = {}) {
   const messages = [];
@@ -48,6 +52,7 @@ function makeContext(responseText, fetchImpl, options = {}) {
   // Browser globals referenced without `window.` in MAIN-world code.
   context.XMLHttpRequest = options.XMLHttpRequest;
   context.globalThis = context;
+  vm.runInNewContext(timingSource, context, { filename: "timing.js" });
   vm.runInNewContext(detectorSource, context, { filename: "detector.js" });
   return { window, messages, context };
 }

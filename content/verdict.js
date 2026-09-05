@@ -220,7 +220,7 @@
     }
     if (serverModel) return "正在核对服务端模型路由元数据。";
     if (evidence.responseEnded) {
-      return "响应已结束，正在等待延迟到达的模型元数据。";
+      return "响应已结束，等待延迟模型元数据。";
     }
     return "已捕获响应，正在等待服务端模型路由元数据。";
   }

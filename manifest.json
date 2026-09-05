@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT 模型路由检测器",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "核对 ChatGPT 浏览器请求模型与服务端公开路由元数据。",
   "action": {
     "default_title": "ChatGPT 模型路由检测器"
@@ -19,6 +19,7 @@
     {
       "matches": ["https://chatgpt.com/*"],
       "js": [
+        "content/timing.js",
         "content/model-rules.js",
         "content/verdict.js",
         "content/turn-state.js",
@@ -29,7 +30,7 @@
     },
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["content/detector.js"],
+      "js": ["content/timing.js", "content/detector.js"],
       "run_at": "document_start",
       "world": "MAIN"
     }
