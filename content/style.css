@@ -246,3 +246,18 @@
     color: #d4d4d8;
   }
 }
+
+.route-warning {
+  margin: 0;
+  padding: 0 12px 10px;
+  color: #946200;
+  font-size: 11px;
+}
+.route-details {
+  max-height: min(65vh, 620px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+@media (prefers-color-scheme: dark) {
+  .route-warning { color: #e2bd65; }
+}
