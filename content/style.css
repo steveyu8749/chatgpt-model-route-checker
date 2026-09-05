@@ -1,0 +1,221 @@
+:host {
+  all: initial;
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  width: min(310px, calc(100vw - 32px));
+  color: #202123;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  pointer-events: auto;
+}
+
+:host([data-status="mismatch"]) .route-card {
+  border-color: #e5484d;
+}
+
+:host([data-status="review"]) .route-card {
+  border-color: #d59b22;
+}
+
+:host([data-status="unavailable"]) .route-card {
+  border-color: #a1a1aa;
+}
+
+.route-card {
+  overflow: hidden;
+  border: 1px solid #d9d9df;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 5px 24px rgba(0, 0, 0, 0.16);
+  backdrop-filter: blur(10px);
+}
+
+.route-summary {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.route-summary:hover {
+  background: rgba(0, 0, 0, 0.035);
+}
+
+.route-summary:focus-visible,
+.route-copy:focus-visible {
+  outline: 2px solid #5b9df9;
+  outline-offset: -2px;
+}
+
+.route-summary-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.route-title {
+  color: #71717a;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.route-status {
+  color: #27754d;
+  font-weight: 700;
+}
+
+:host([data-status="checking"]) .route-status {
+  color: #8a6914;
+}
+
+:host([data-status="mismatch"]) .route-status {
+  color: #b4232b;
+}
+
+:host([data-status="review"]) .route-status {
+  color: #946200;
+}
+
+:host([data-status="unavailable"]) .route-status {
+  color: #64646e;
+}
+
+.route-model-line {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: #202123;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.route-details {
+  padding: 0 12px 11px;
+}
+
+.route-reason {
+  margin: 0 0 9px;
+  padding-top: 9px;
+  border-top: 1px solid #ececf0;
+  color: #52525b;
+  font-size: 12px;
+}
+
+.route-fields {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+
+.route-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+  gap: 8px;
+  margin: 0;
+}
+
+.route-field-label,
+.route-field-value {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.route-field-label {
+  color: #71717a;
+  font-size: 11px;
+}
+
+.route-field-value {
+  color: #27272a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
+.route-field-value.is-optional {
+  color: #a1a1aa;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-style: italic;
+}
+
+.route-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid #ececf0;
+}
+
+.route-note {
+  color: #a1a1aa;
+  font-size: 10px;
+}
+
+.route-copy {
+  padding: 4px 7px;
+  border: 1px solid #d4d4d8;
+  border-radius: 6px;
+  background: #fafafa;
+  color: #52525b;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.route-copy:hover {
+  background: #f0f0f2;
+}
+
+@media (prefers-color-scheme: dark) {
+  :host {
+    color: #ececf1;
+  }
+
+  .route-card {
+    border-color: #45454f;
+    background: rgba(32, 33, 35, 0.97);
+  }
+
+  .route-summary:hover,
+  .route-copy {
+    background: rgba(255, 255, 255, 0.07);
+  }
+
+  .route-model-line,
+  .route-field-value {
+    color: #f4f4f5;
+  }
+
+  .route-field-value.is-optional {
+    color: #8d8d99;
+  }
+
+  .route-reason,
+  .route-field-label {
+    color: #b7b7c1;
+  }
+
+  .route-reason,
+  .route-footer {
+    border-color: #45454f;
+  }
+
+  .route-copy {
+    border-color: #5a5a65;
+    color: #d4d4d8;
+  }
+}

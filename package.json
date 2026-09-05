@@ -1,0 +1,10 @@
+{
+  "name": "chatgpt-model-route-checker",
+  "private": true,
+  "version": "1.0.1",
+  "description": "A conservative ChatGPT model route consistency checker browser extension.",
+  "scripts": {
+    "test": "node --test test/verdict.test.js test/detector.test.js",
+    "check": "node test/static-check.js"
+  }
+}

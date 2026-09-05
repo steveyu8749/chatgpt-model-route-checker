@@ -1,0 +1,65 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = path.resolve(__dirname, "..");
+const manifest = JSON.parse(
+  fs.readFileSync(path.join(root, "manifest.json"), "utf8")
+);
+const detector = fs.readFileSync(
+  path.join(root, "content", "detector.js"),
+  "utf8"
+);
+const content = fs.readFileSync(
+  path.join(root, "content", "content.js"),
+  "utf8"
+);
+const rules = fs.readFileSync(
+  path.join(root, "content", "model-rules.js"),
+  "utf8"
+);
+const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+
+assert.equal(manifest.manifest_version, 3);
+assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"]);
+assert.equal(manifest.content_scripts.length, 2);
+assert.deepEqual(manifest.web_accessible_resources, [
+  {
+    resources: ["content/style.css"],
+    matches: ["https://chatgpt.com/*"]
+  }
+]);
+
+const worlds = new Set(manifest.content_scripts.map((script) => script.world));
+assert.deepEqual(worlds, new Set(["MAIN", "ISOLATED"]));
+for (const script of manifest.content_scripts) {
+  assert.deepEqual(script.matches, ["https://chatgpt.com/*"]);
+  assert.equal(script.run_at, "document_start");
+}
+
+assert.match(detector, /window\.fetch/);
+assert.match(detector, /XMLHttpRequest/);
+assert.match(detector, /server_ste_metadata/);
+assert.match(detector, /window\.postMessage/);
+assert.match(detector, /TELEMETRY_ASSOCIATION_WINDOW_MS/);
+assert.match(detector, /createStreamParser/);
+for (const key of ["content", "parts", "messages", "attachments", "files", "prompt", "body"]) {
+  assert.match(detector, new RegExp(`"${key}"`));
+}
+assert.doesNotMatch(detector, /chrome\.storage/);
+assert.doesNotMatch(detector, /localStorage/);
+assert.doesNotMatch(content, /chrome\.storage/);
+assert.match(content, /NETWORK_EVIDENCE_TYPES/);
+assert.match(content, /NETWORK_EVIDENCE_TYPES\.has\(data\.type\) && !eventId/);
+assert.match(content, /RESPONSE_END_GRACE_MS/);
+assert.match(content, /未提供（可选）/);
+assert.match(content, /request\.model/);
+assert.match(content, /resolved_model_slug/);
+assert.match(content, /data-message-model-slug/);
+assert.match(content, /getURL\("content\/style\.css"\)/);
+assert.match(rules, /equivalent: Object\.freeze\(\[\]\)/);
+assert.match(rules, /incompatible: Object\.freeze\(\[\]\)/);
+assert.match(readme, /不上传/);
+assert.match(readme, /不能证明 OpenAI GPU/);
+
+console.log("Static extension checks passed.");
