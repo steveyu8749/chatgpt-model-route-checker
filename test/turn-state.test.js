@@ -26,8 +26,9 @@ function classifyTurn(turn) {
   });
 }
 
-test("the shared metadata window is a single six-second policy", () => {
-  assert.equal(timing.MODEL_METADATA_WAIT_WINDOW_MS, 6000);
+test("foreground and background metadata windows are explicit", () => {
+  assert.equal(timing.DISPLAY_METADATA_WAIT_WINDOW_MS, 3000);
+  assert.equal(timing.TELEMETRY_ASSOCIATION_WINDOW_MS, 15000);
 });
 
 test("a new request becomes current while its duplicate cannot steal a newer turn", () => {
@@ -82,7 +83,7 @@ test("a response ending at 2.5 seconds is still checking for delayed metadata", 
   const state = turnState.delayedMetadataState(
     turn,
     4500,
-    timing.MODEL_METADATA_WAIT_WINDOW_MS
+    timing.DISPLAY_METADATA_WAIT_WINDOW_MS
   );
   const result = classifyTurn(turn);
 
@@ -93,7 +94,7 @@ test("a response ending at 2.5 seconds is still checking for delayed metadata", 
   assert.match(result.reason, /等待延迟模型元数据/);
 });
 
-test("a server model arriving between 2.5 and 6 seconds immediately matches", () => {
+test("a server model arriving before the three-second foreground deadline matches", () => {
   const turn = turnState.createTurn("turn-1", 1000);
   turnState.captureRequest(turn, { model: "gpt-late" }, 1000);
   turnState.startResponse(turn, "sse", 1100);
@@ -106,24 +107,24 @@ test("a server model arriving between 2.5 and 6 seconds immediately matches", ()
   const before = turnState.delayedMetadataState(
     turn,
     4500,
-    timing.MODEL_METADATA_WAIT_WINDOW_MS
+    timing.DISPLAY_METADATA_WAIT_WINDOW_MS
   );
   assert.equal(before.waiting, true);
   assert.equal(before.expired, false);
 
-  turnState.addEvidence(turn, "serverModel", "gpt-late", 5000);
+  turnState.addEvidence(turn, "serverModel", "gpt-late", 4800);
   const result = classifyTurn(turn);
   const after = turnState.delayedMetadataState(
     turn,
-    5000,
-    timing.MODEL_METADATA_WAIT_WINDOW_MS
+    4800,
+    timing.DISPLAY_METADATA_WAIT_WINDOW_MS
   );
-  const relative = turnState.relativeTiming(turn, 5000);
+  const relative = turnState.relativeTiming(turn, 4800);
 
   assert.equal(result.status, verdict.STATUS.MATCH);
   assert.equal(after.waiting, false);
-  assert.equal(relative.responseEndToServerModelMs, 3000);
-  assert.equal(relative.totalElapsedMs, 4000);
+  assert.equal(relative.responseEndToServerModelMs, 2800);
+  assert.equal(relative.totalElapsedMs, 3800);
   assert.equal(relative.settled, true);
 });
 
@@ -139,14 +140,14 @@ test("missing server metadata becomes unavailable only after the full window", (
 
   const state = turnState.delayedMetadataState(
     turn,
-    8000,
-    timing.MODEL_METADATA_WAIT_WINDOW_MS
+    5000,
+    timing.DISPLAY_METADATA_WAIT_WINDOW_MS
   );
   assert.equal(state.waiting, true);
   assert.equal(state.expired, true);
-  assert.equal(state.elapsedMs, timing.MODEL_METADATA_WAIT_WINDOW_MS);
+  assert.equal(state.elapsedMs, timing.DISPLAY_METADATA_WAIT_WINDOW_MS);
 
-  turnState.complete(turn, 8000);
+  turnState.complete(turn, 5000);
   const result = classifyTurn(turn);
   const relative = turnState.relativeTiming(turn, 20000);
   assert.equal(result.status, verdict.STATUS.UNAVAILABLE);
@@ -154,9 +155,30 @@ test("missing server metadata becomes unavailable only after the full window", (
     result.unavailableReason,
     verdict.UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS
   );
-  assert.equal(relative.responseEndElapsedMs, 6000);
-  assert.equal(relative.totalElapsedMs, 7000);
+  assert.equal(relative.responseEndElapsedMs, 3000);
+  assert.equal(relative.totalElapsedMs, 4000);
   assert.equal(relative.settled, true);
+});
+
+test("late telemetry can recover a turn after the foreground result settles", () => {
+  const turn = turnState.createTurn("turn-late", 1000);
+  turnState.captureRequest(turn, { model: "gpt-late-background" }, 1000);
+  turnState.startResponse(turn, "json", 1100);
+  turnState.endResponse(
+    turn,
+    { endReason: "completed", responseStarted: true },
+    2000
+  );
+  turnState.complete(turn, 5000);
+  assert.equal(classifyTurn(turn).status, verdict.STATUS.UNAVAILABLE);
+
+  turnState.addEvidence(turn, "serverModel", "gpt-late-background", 12000);
+  const result = classifyTurn(turn);
+  assert.equal(result.status, verdict.STATUS.MATCH);
+  assert.equal(
+    turnState.relativeTiming(turn, 12000).responseEndToServerModelMs,
+    10000
+  );
 });
 
 test("an unsettled turn reports elapsed time only up to the observation point", () => {

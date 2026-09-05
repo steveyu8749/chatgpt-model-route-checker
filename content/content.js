@@ -6,22 +6,20 @@
   const HOST_ID = "__chatgpt_model_route_checker_host__";
   const MAX_TURNS = 8;
   const RESPONSE_WAIT_TIMEOUT_MS = 30000;
-  const FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS = 6000;
-  function modelMetadataWaitWindow() {
+  const FALLBACK_DISPLAY_METADATA_WAIT_WINDOW_MS = 3000;
+  function displayMetadataWaitWindow() {
     try {
       const shared = window.ChatGPTRouteTiming;
-      const value = shared && shared.MODEL_METADATA_WAIT_WINDOW_MS;
-      // Accept only the versioned six-second policy so a malformed or
-      // replaced object cannot make the two worlds wait for different times.
+      const value = shared && shared.DISPLAY_METADATA_WAIT_WINDOW_MS;
       const normalized = Number.isFinite(value) ? Math.floor(value) : null;
-      return normalized === FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS
+      return normalized === FALLBACK_DISPLAY_METADATA_WAIT_WINDOW_MS
         ? normalized
-        : FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+        : FALLBACK_DISPLAY_METADATA_WAIT_WINDOW_MS;
     } catch {
-      return FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+      return FALLBACK_DISPLAY_METADATA_WAIT_WINDOW_MS;
     }
   }
-  const MODEL_METADATA_WAIT_WINDOW_MS = modelMetadataWaitWindow();
+  const DISPLAY_METADATA_WAIT_WINDOW_MS = displayMetadataWaitWindow();
   const DETECTOR_CONNECT_TIMEOUT_MS = 5000;
   const DETECTOR_PING_INTERVAL_MS = 250;
   const DETECTOR_RETRY_INTERVAL_MS = 1000;
@@ -34,6 +32,7 @@
     "resolved-model",
     "requested-experience",
     "thinking-effort",
+    "telemetry-observation",
     "response-end"
   ]);
   const api = window.ChatGPTRouteVerdict;
@@ -94,6 +93,45 @@
     return `fetch=${healthStatusLabel(health.fetch)}，XHR=${healthStatusLabel(
       health.xhr
     )}，beacon=${healthStatusLabel(health.beacon)}`;
+  }
+
+  function telemetryCounters() {
+    const telemetry = detectorConnection.health?.telemetry;
+    if (!telemetry) return null;
+    return Object.fromEntries(
+      Object.entries(telemetry).map(([key, value]) => [key, safeCount(value)])
+    );
+  }
+
+  function telemetryDelta(turn) {
+    const current = telemetryCounters();
+    if (!current) return null;
+    const baseline = turn?.telemetryBaseline || {};
+    return Object.fromEntries(
+      Object.entries(current).map(([key, value]) => [
+        key,
+        Math.max(0, value - safeCount(baseline[key]))
+      ])
+    );
+  }
+
+  function telemetrySummary(turn) {
+    if (!turn) return "本轮尚未开始";
+    const delta = telemetryDelta(turn);
+    if (!delta) return "未确认";
+    const observation = turn.telemetryObservation;
+    const delay = observation && Number.isFinite(observation.delayMs)
+      ? `，最近关联延迟 ${durationLabel(observation.delayMs, true)}`
+      : "";
+    return [
+      `观察 ${delta.observed}`,
+      `可读 ${delta.readable}`,
+      `已关联 ${delta.associated}`,
+      `含模型 ${delta.modelFound}`,
+      `无候选丢弃 ${delta.droppedNoCandidate}`,
+      `多轮歧义丢弃 ${delta.droppedAmbiguous}`,
+      `超窗丢弃 ${delta.droppedExpired}`
+    ].join("，") + delay;
   }
 
   function stopDetectorPing() {
@@ -212,11 +250,11 @@
     const waitState = turnState.delayedMetadataState(
       turn,
       Date.now(),
-      MODEL_METADATA_WAIT_WINDOW_MS
+      DISPLAY_METADATA_WAIT_WINDOW_MS
     );
     const delay = waitState.waiting && Number.isFinite(waitState.remainingMs)
       ? waitState.remainingMs
-      : MODEL_METADATA_WAIT_WINDOW_MS;
+      : DISPLAY_METADATA_WAIT_WINDOW_MS;
 
     turn.completionTimer = window.setTimeout(() => {
       turn.completionTimer = null;
@@ -232,7 +270,7 @@
       const currentWaitState = turnState.delayedMetadataState(
         turn,
         Date.now(),
-        MODEL_METADATA_WAIT_WINDOW_MS
+        DISPLAY_METADATA_WAIT_WINDOW_MS
       );
       if (currentWaitState.waiting && !currentWaitState.expired) {
         scheduleCompletion(turn);
@@ -304,12 +342,19 @@
     }
     const delayedMetadataWaiting = turnState.isWaitingForDelayedMetadata(turn);
     const serverWaiting = turn.responseStarted && !turn.responseEnded;
+    const serverNotPublished = Boolean(
+      turn.complete && turn.responseEnded && !turn.serverModel
+    );
     return `${formatEvidenceValue(turn, "requestModel")} → ${formatEvidenceValue(
       turn,
       "serverModel",
       false,
-      serverWaiting || delayedMetadataWaiting,
-      delayedMetadataWaiting ? "等待延迟模型元数据…" : undefined
+      serverWaiting || delayedMetadataWaiting || serverNotPublished,
+      delayedMetadataWaiting
+        ? "等待延迟模型元数据…"
+        : serverNotPublished
+          ? "本轮暂未公开"
+          : undefined
     )}`;
   }
 
@@ -570,7 +615,8 @@
         stats.payloadCount
       )}，解析异常：${safeCount(stats.parseErrorCount)}，字节数：${safeCount(
         stats.byteCount
-      )}`
+      )}`,
+      `telemetry：${telemetrySummary(turn)}`
     ];
     const conflicts = evidenceConflictSummary(turn);
     if (conflicts) parts.push(`证据冲突：${conflicts}`);
@@ -596,6 +642,7 @@
           : "未确认"
       }`,
       `采集器健康：${detectorHealthSummary()}`,
+      `本轮 telemetry：${telemetrySummary(turn)}`,
       `状态：${displayStatusLabel(result)}`,
       `判定理由：${result.reason}`,
       `不可用原因：${
@@ -611,8 +658,17 @@
         turn,
         "serverModel",
         false,
-        turnState.isWaitingForDelayedMetadata(turn),
-        "等待延迟模型元数据…"
+        turnState.isWaitingForDelayedMetadata(turn) ||
+          Boolean(
+            turn &&
+            turn.complete &&
+            turn.responseStarted &&
+            turn.responseEnded &&
+            !turn.serverModel
+          ),
+        turnState.isWaitingForDelayedMetadata(turn)
+          ? "等待延迟模型元数据…"
+          : "本轮暂未公开"
       )}`,
       `${FIELD_LABELS.assistantModel}：${formatEvidenceValue(
         turn,
@@ -719,9 +775,17 @@
                 field,
                 optional,
                 field === "serverModel" &&
-                  turnState.isWaitingForDelayedMetadata(turn),
+                  (turnState.isWaitingForDelayedMetadata(turn) ||
+                    Boolean(
+                      turn.complete &&
+                      turn.responseStarted &&
+                      turn.responseEnded &&
+                      !turn.serverModel
+                    )),
                 field === "serverModel"
-                  ? "等待延迟模型元数据…"
+                  ? turnState.isWaitingForDelayedMetadata(turn)
+                    ? "等待延迟模型元数据…"
+                    : "本轮暂未公开"
                   : undefined
               )
             : null,
@@ -780,7 +844,11 @@
       return;
     }
 
-    if (data.type === "detector-pong" || data.type === "detector-ready") {
+    if (
+      data.type === "detector-pong" ||
+      data.type === "detector-ready" ||
+      data.type === "detector-telemetry"
+    ) {
       acceptDetectorHealth(data.health);
       return;
     }
@@ -795,6 +863,10 @@
       });
       const turn = result && result.turn;
       if (!turn) return;
+
+      if (!turn.telemetryBaseline) {
+        turn.telemetryBaseline = telemetryCounters() || {};
+      }
 
       // Capture the last assistant node before this request starts. Existing
       // DOM nodes can be detached and re-mounted while a new response is
@@ -872,6 +944,15 @@
         break;
       case "thinking-effort":
         turnState.addEvidence(turn, "thinkingEffort", value);
+        break;
+      case "telemetry-observation":
+        turn.telemetryObservation = {
+          readable: Boolean(data.readable),
+          modelFound: Boolean(data.modelFound),
+          delayMs: Number.isFinite(data.delayMs)
+            ? Math.min(Math.max(Math.floor(data.delayMs), 0), 15000)
+            : null
+        };
         break;
       case "response-end":
         if (turn.responseWaitTimer) {

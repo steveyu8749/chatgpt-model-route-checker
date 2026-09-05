@@ -18,6 +18,15 @@
     "failed"
   ]);
   const HEALTH_STATUS_SET = new Set(HEALTH_STATUSES);
+  const TELEMETRY_COUNTERS = Object.freeze([
+    "observed",
+    "readable",
+    "associated",
+    "modelFound",
+    "droppedNoCandidate",
+    "droppedAmbiguous",
+    "droppedExpired"
+  ]);
 
   function clean(value, maxLength = 40) {
     if (typeof value !== "string") return null;
@@ -28,19 +37,30 @@
   }
 
   function normalizeHealth(health) {
-    if (!health || typeof health !== "object") return null;
-    const detectorVersion = clean(health.detectorVersion);
-    if (!detectorVersion) return null;
+    try {
+      if (!health || typeof health !== "object") return null;
+      const detectorVersion = clean(health.detectorVersion);
+      if (!detectorVersion) return null;
 
-    const result = { detectorVersion };
-    for (const key of ["fetch", "xhr", "beacon"]) {
-      const value = health[key];
-      if (typeof value !== "string" || !HEALTH_STATUS_SET.has(value)) {
-        return null;
+      const result = { detectorVersion };
+      for (const key of ["fetch", "xhr", "beacon"]) {
+        const value = health[key];
+        if (typeof value !== "string" || !HEALTH_STATUS_SET.has(value)) {
+          return null;
+        }
+        result[key] = value;
       }
-      result[key] = value;
+      if (!health.telemetry || typeof health.telemetry !== "object") return null;
+      result.telemetry = {};
+      for (const key of TELEMETRY_COUNTERS) {
+        const value = health.telemetry[key];
+        if (!Number.isFinite(value) || value < 0) return null;
+        result.telemetry[key] = Math.min(Math.floor(value), 100000);
+      }
+      return result;
+    } catch {
+      return null;
     }
-    return result;
   }
 
   function createState() {
@@ -66,6 +86,7 @@
 
   return Object.freeze({
     HEALTH_STATUSES,
+    TELEMETRY_COUNTERS,
     normalizeHealth,
     createState,
     accept,

@@ -139,7 +139,7 @@ test("fetch bridge emits model evidence without forwarding message content", asy
   assert.equal(responseEnd.responseUnsupported, false);
 });
 
-test("missing timing policy uses the six-second fallback and keeps the bridge active", async () => {
+test("missing timing policy uses the fifteen-second fallback and keeps the bridge active", async () => {
   const responseText = `data: ${JSON.stringify({
     server_ste_metadata: { model_slug: "gpt-timing-fallback" }
   })}\n\ndata: [DONE]\n\n`;
@@ -167,7 +167,7 @@ test("malformed timing policy falls back without disabling request capture", asy
     server_ste_metadata: { model_slug: "gpt-timing-malformed" }
   })}\n\ndata: [DONE]\n\n`;
   const timingOverride = {};
-  Object.defineProperty(timingOverride, "MODEL_METADATA_WAIT_WINDOW_MS", {
+  Object.defineProperty(timingOverride, "TELEMETRY_ASSOCIATION_WINDOW_MS", {
     get() {
       throw new Error("timing policy unavailable");
     }
@@ -186,12 +186,12 @@ test("malformed timing policy falls back without disabling request capture", asy
   assert.ok(messages.some((message) => message.type === "server-model"));
 });
 
-test("a non-six-second timing value is treated as malformed", async () => {
+test("a non-fifteen-second timing value is treated as malformed", async () => {
   const responseText = `data: ${JSON.stringify({
     server_ste_metadata: { model_slug: "gpt-timing-value" }
   })}\n\ndata: [DONE]\n\n`;
   const { window, messages } = makeContext(responseText, null, {
-    timingOverride: { MODEL_METADATA_WAIT_WINDOW_MS: 7000 }
+    timingOverride: { TELEMETRY_ASSOCIATION_WINDOW_MS: 7000 }
   });
 
   await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
@@ -222,12 +222,22 @@ test("isolated pings receive a bounded detector health response", () => {
     "beacon",
     "detectorVersion",
     "fetch",
+    "telemetry",
     "xhr"
   ]);
-  assert.equal(pong.health.detectorVersion, "1.1.3");
+  assert.equal(pong.health.detectorVersion, "1.1.4");
   assert.equal(pong.health.fetch, "installed");
   assert.equal(pong.health.xhr, "unavailable");
   assert.equal(pong.health.beacon, "unavailable");
+  assert.deepEqual(JSON.parse(JSON.stringify(pong.health.telemetry)), {
+    observed: 0,
+    readable: 0,
+    associated: 0,
+    modelFound: 0,
+    droppedNoCandidate: 0,
+    droppedAmbiguous: 0,
+    droppedExpired: 0
+  });
   assert.doesNotMatch(JSON.stringify(pong), /url|requestId|messages|content|body/i);
 });
 
@@ -605,6 +615,36 @@ test("telemetry is associated only when one recent conversation is unambiguous",
   assert.ok(request);
   assert.ok(telemetryModel);
   assert.equal(telemetryModel.requestId, request.requestId);
+  const observation = messages.find(
+    (message) => message.type === "telemetry-observation"
+  );
+  assert.equal(observation.requestId, request.requestId);
+  assert.equal(observation.readable, true);
+  assert.equal(observation.modelFound, true);
+  const health = messages
+    .filter((message) => message.type === "detector-telemetry")
+    .at(-1).health.telemetry;
+  assert.equal(health.observed, 1);
+  assert.equal(health.associated, 1);
+  assert.equal(health.modelFound, 1);
+});
+
+test("unreadable telemetry without a candidate is counted without leaking data", async () => {
+  const { window, messages } = makeContext("{}");
+  await window.fetch("https://chatgpt.com/ces/v1/telemetry/intake", {
+    method: "POST",
+    body: ""
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const health = messages
+    .filter((message) => message.type === "detector-telemetry")
+    .at(-1).health.telemetry;
+  assert.equal(health.observed, 1);
+  assert.equal(health.readable, 0);
+  assert.equal(health.associated, 0);
+  assert.equal(health.droppedNoCandidate, 1);
+  assert.doesNotMatch(JSON.stringify(messages), /https:\/\/chatgpt\.com\/ces/);
 });
 
 test("ordinary telemetry metadata.model_slug is not promoted to server evidence", async () => {
@@ -625,6 +665,11 @@ test("ordinary telemetry metadata.model_slug is not promoted to server evidence"
     messages.some((message) => message.type === "server-model"),
     false
   );
+  const observation = messages.find(
+    (message) => message.type === "telemetry-observation"
+  );
+  assert.equal(observation.readable, true);
+  assert.equal(observation.modelFound, false);
 });
 
 test("ambiguous telemetry is dropped instead of entering either recent turn", async () => {
@@ -657,6 +702,63 @@ test("ambiguous telemetry is dropped instead of entering either recent turn", as
       .map((message) => message.value),
     []
   );
+  const health = messages
+    .filter((message) => message.type === "detector-telemetry")
+    .at(-1).health.telemetry;
+  assert.equal(health.droppedAmbiguous, 1);
+});
+
+test("telemetry remains attributable for fifteen seconds after response end", async () => {
+  const clock = { now: 1000 };
+  const { window, messages } = makeContext("{}", null, { clock });
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-late-telemetry" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  clock.now = 12000;
+
+  await window.fetch("https://chatgpt.com/ces/v1/telemetry/intake", {
+    method: "POST",
+    body: JSON.stringify({
+      server_ste_metadata: { model_slug: "gpt-late-telemetry" }
+    })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const observation = messages.find(
+    (message) => message.type === "telemetry-observation"
+  );
+  assert.equal(observation.modelFound, true);
+  assert.equal(observation.delayMs, 11000);
+});
+
+test("telemetry after the association window is diagnosed as expired", async () => {
+  const clock = { now: 1000 };
+  const { window, messages } = makeContext("{}", null, { clock });
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-expired-telemetry" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  clock.now = 17001;
+
+  await window.fetch("https://chatgpt.com/ces/v1/telemetry/intake", {
+    method: "POST",
+    body: JSON.stringify({
+      server_ste_metadata: { model_slug: "must-not-attach" }
+    })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(
+    messages.some((message) => message.value === "must-not-attach"),
+    false
+  );
+  const health = messages
+    .filter((message) => message.type === "detector-telemetry")
+    .at(-1).health.telemetry;
+  assert.equal(health.droppedExpired, 1);
 });
 
 test("fake model JSON inside assistant content is ignored while real metadata is retained", async () => {

@@ -16,31 +16,26 @@
   const MAX_SCAN_NODES = 12000;
   const STREAM_BUFFER_LIMIT = 2 * 1024 * 1024;
   // `timing.js` is normally loaded immediately before this file in the MAIN
-  // world.  Content-script ordering across worlds can nevertheless vary, and
-  // an earlier page script can replace the shared object.  A missing or
-  // malformed timing object must not disable the request bridge: use the
-  // same six-second policy as a bounded local fallback.
-  const FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS = 6000;
-  function modelMetadataWaitWindow() {
+  // world. A missing or malformed timing object must not disable the request
+  // bridge, so late telemetry retains a bounded local fallback.
+  const FALLBACK_TELEMETRY_ASSOCIATION_WINDOW_MS = 15000;
+  function telemetryAssociationWindow() {
     try {
       const shared = window.ChatGPTRouteTiming;
-      const value = shared && shared.MODEL_METADATA_WAIT_WINDOW_MS;
-      // Accept only the versioned six-second policy.  A different finite
-      // value is still a configuration drift, not a reason to let the two
-      // worlds silently wait for different durations.
+      const value = shared && shared.TELEMETRY_ASSOCIATION_WINDOW_MS;
       const normalized = Number.isFinite(value) ? Math.floor(value) : null;
-      return normalized === FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS
+      return normalized === FALLBACK_TELEMETRY_ASSOCIATION_WINDOW_MS
         ? normalized
-        : FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+        : FALLBACK_TELEMETRY_ASSOCIATION_WINDOW_MS;
     } catch {
-      return FALLBACK_MODEL_METADATA_WAIT_WINDOW_MS;
+      return FALLBACK_TELEMETRY_ASSOCIATION_WINDOW_MS;
     }
   }
-  const MODEL_METADATA_WAIT_WINDOW_MS = modelMetadataWaitWindow();
+  const TELEMETRY_ASSOCIATION_WINDOW_MS = telemetryAssociationWindow();
   const ACTIVE_RECORD_RETENTION_MS = 5 * 60 * 1000;
-  const ENDED_RECORD_RETENTION_MS = 15000;
+  const ENDED_RECORD_RETENTION_MS = 30000;
   const RESPONSE_PROGRESS_INTERVAL_MS = 1000;
-  const DETECTOR_VERSION = "1.1.3";
+  const DETECTOR_VERSION = "1.1.4";
   const SKIP_RECURSION_KEYS = new Set([
     "content",
     "parts",
@@ -56,7 +51,7 @@
   if (window[stateKey]) return;
   window[stateKey] = {
     detectorVersion: DETECTOR_VERSION,
-    timingWindowMs: MODEL_METADATA_WAIT_WINDOW_MS
+    telemetryWindowMs: TELEMETRY_ASSOCIATION_WINDOW_MS
   };
 
   let fetchWrapper = null;
@@ -69,6 +64,16 @@
   let fetchInstallSucceeded = false;
   let xhrInstallSucceeded = false;
   let beaconInstallSucceeded = false;
+
+  const telemetryStats = {
+    observed: 0,
+    readable: 0,
+    associated: 0,
+    modelFound: 0,
+    droppedNoCandidate: 0,
+    droppedAmbiguous: 0,
+    droppedExpired: 0
+  };
 
   let sequence = 0;
   const conversationRecords = new Map();
@@ -159,25 +164,88 @@
     return record;
   }
 
-  function telemetryRequestId() {
+  function telemetryAssociation() {
     const now = Date.now();
     cleanupConversationRecords(now);
 
-    const candidates = [...conversationRecords.entries()].filter(([, record]) => {
+    const eligible = [...conversationRecords.entries()].filter(([, record]) => {
       if (!record.telemetryEligible || record.serverModelSeen) return false;
+      return true;
+    });
+    const candidates = eligible.filter(([, record]) => {
       const referenceTime =
         record.endedAt || record.lastActivityAt || record.startedAt;
       const window = record.endedAt
-        ? MODEL_METADATA_WAIT_WINDOW_MS
+        ? TELEMETRY_ASSOCIATION_WINDOW_MS
         : ACTIVE_RECORD_RETENTION_MS;
       return now - referenceTime <= window;
     });
 
-    // If more than one conversation is still plausible, do not attach
-    // telemetry to the wrong turn. The normal stream evidence remains
-    // authoritative, and a later unambiguous telemetry event can still be
-    // accepted.
-    return candidates.length === 1 ? candidates[0][0] : null;
+    if (candidates.length === 1) {
+      const [requestIdValue, record] = candidates[0];
+      return {
+        requestId: requestIdValue,
+        outcome: "associated",
+        delayMs: record.endedAt
+          ? Math.max(0, Math.floor(now - record.endedAt))
+          : null
+      };
+    }
+    if (candidates.length > 1) {
+      return { requestId: null, outcome: "ambiguous", delayMs: null };
+    }
+
+    const hasExpired = eligible.some(([, record]) => {
+      if (!record.endedAt) return false;
+      return now - record.endedAt > TELEMETRY_ASSOCIATION_WINDOW_MS;
+    });
+    return {
+      requestId: null,
+      outcome: hasExpired ? "expired" : "no-candidate",
+      delayMs: null
+    };
+  }
+
+  function incrementTelemetryStat(key) {
+    if (!Object.prototype.hasOwnProperty.call(telemetryStats, key)) return;
+    telemetryStats[key] = Math.min(telemetryStats[key] + 1, 100000);
+  }
+
+  function emitTelemetryHealth() {
+    emit("detector-telemetry", { health: healthSnapshot() });
+  }
+
+  function processTelemetryText(text) {
+    incrementTelemetryStat("observed");
+    const readable = typeof text === "string" && text.length > 0;
+    if (readable) incrementTelemetryStat("readable");
+
+    const association = telemetryAssociation();
+    if (association.outcome === "associated") {
+      incrementTelemetryStat("associated");
+      const record = conversationRecords.get(association.requestId);
+      const hadServerModel = Boolean(record && record.serverModelSeen);
+      if (readable) scanWholeText(text, association.requestId);
+      const modelFound = Boolean(
+        record && !hadServerModel && record.serverModelSeen
+      );
+      if (modelFound) incrementTelemetryStat("modelFound");
+      emit("telemetry-observation", {
+        requestId: association.requestId,
+        readable,
+        modelFound,
+        delayMs: Number.isFinite(association.delayMs)
+          ? Math.min(association.delayMs, TELEMETRY_ASSOCIATION_WINDOW_MS)
+          : null
+      });
+    } else if (association.outcome === "ambiguous") {
+      incrementTelemetryStat("droppedAmbiguous");
+    } else if (association.outcome === "expired") {
+      incrementTelemetryStat("droppedExpired");
+    } else {
+      incrementTelemetryStat("droppedNoCandidate");
+    }
+    emitTelemetryHealth();
   }
 
   function closeConversation(id, details = {}) {
@@ -265,7 +333,16 @@
         beaconInstallSucceeded,
         safeGet(pageNavigator, "sendBeacon"),
         beaconWrapper
-      )
+      ),
+      telemetry: {
+        observed: telemetryStats.observed,
+        readable: telemetryStats.readable,
+        associated: telemetryStats.associated,
+        modelFound: telemetryStats.modelFound,
+        droppedNoCandidate: telemetryStats.droppedNoCandidate,
+        droppedAmbiguous: telemetryStats.droppedAmbiguous,
+        droppedExpired: telemetryStats.droppedExpired
+      }
     };
   }
 
@@ -408,7 +485,7 @@
     const cleaned = scalar(value);
     if (!cleaned) return;
 
-    const targetRequestId = requestIdValue || telemetryRequestId();
+    const targetRequestId = requestIdValue;
     // Every network-derived field must be tied to one known conversation.
     // In particular, never emit a null id that the isolated world could
     // accidentally attach to whichever turn is currently visible.
@@ -1034,11 +1111,8 @@
         captureRequestAsync(id, input, init);
       } else if (telemetry) {
         requestBodyText(input, init)
-          .then((text) => {
-            const requestIdValue = telemetryRequestId();
-            scanWholeText(text, requestIdValue);
-          })
-          .catch(() => {});
+          .then(processTelemetryText)
+          .catch(() => processTelemetryText(""));
       }
 
       let result;
@@ -1220,11 +1294,8 @@
         );
       } else if (telemetry) {
         bodyToText(body)
-          .then((text) => {
-            const requestIdValue = telemetryRequestId();
-            scanWholeText(text, requestIdValue);
-          })
-          .catch(() => {});
+          .then(processTelemetryText)
+          .catch(() => processTelemetryText(""));
       }
 
       try {
@@ -1255,11 +1326,8 @@
     beaconWrapper = function routeCheckerBeacon(url, data) {
       if (isTelemetry(url, "POST")) {
         bodyToText(data)
-          .then((text) => {
-            const requestIdValue = telemetryRequestId();
-            scanWholeText(text, requestIdValue);
-          })
-          .catch(() => {});
+          .then(processTelemetryText)
+          .catch(() => processTelemetryText(""));
       }
       return nativeBeacon.apply(this, arguments);
     };

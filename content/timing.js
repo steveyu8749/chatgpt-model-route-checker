@@ -1,9 +1,9 @@
 /*
  * Shared timing policy for the MAIN and ISOLATED content scripts.
  *
- * This file is loaded in both worlds so the telemetry association window and
- * the UI's delayed-metadata grace period cannot drift apart. It contains no
- * page data and is also directly require-able by the Node test suite.
+ * This file is loaded in both worlds. The short foreground window limits how
+ * long the UI remains in a checking state, while the longer background window
+ * still accepts safely attributable telemetry that arrives later.
  */
 (function installTiming(root, factory) {
   const api = factory();
@@ -20,9 +20,11 @@
     window.ChatGPTRouteTiming = api;
   }
 })(typeof globalThis !== "undefined" ? globalThis : window, function createApi() {
-  const MODEL_METADATA_WAIT_WINDOW_MS = 6000;
+  const DISPLAY_METADATA_WAIT_WINDOW_MS = 3000;
+  const TELEMETRY_ASSOCIATION_WINDOW_MS = 15000;
 
   return Object.freeze({
-    MODEL_METADATA_WAIT_WINDOW_MS
+    DISPLAY_METADATA_WAIT_WINDOW_MS,
+    TELEMETRY_ASSOCIATION_WINDOW_MS
   });
 });
