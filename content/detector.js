@@ -2,9 +2,10 @@
 /*
  * MAIN-world bridge.
  *
- * This file deliberately forwards only model-related scalar values. It never
- * forwards request messages, response text, attachments, URLs, headers, or
- * account information to the isolated content script.
+ * This file deliberately forwards only model-related scalar values plus
+ * bounded parser/lifecycle counters. It never forwards request messages,
+ * response text, attachments, URLs, headers, or account information to the
+ * isolated content script.
  */
 (function installDetector() {
   "use strict";
@@ -14,9 +15,9 @@
   const MAX_SCAN_DEPTH = 18;
   const MAX_SCAN_NODES = 12000;
   const STREAM_BUFFER_LIMIT = 2 * 1024 * 1024;
-  const TELEMETRY_ASSOCIATION_WINDOW_MS = 4000;
+  const TELEMETRY_ASSOCIATION_WINDOW_MS = 6000;
   const ACTIVE_RECORD_RETENTION_MS = 5 * 60 * 1000;
-  const ENDED_RECORD_RETENTION_MS = 10000;
+  const ENDED_RECORD_RETENTION_MS = 15000;
   const SKIP_RECURSION_KEYS = new Set([
     "content",
     "parts",
@@ -67,14 +68,46 @@
     cleanupConversationRecords(now);
     conversationRecords.set(id, {
       startedAt: now,
-      endedAt: null
+      lastActivityAt: now,
+      endedAt: null,
+      responseStarted: false,
+      serverModelSeen: false,
+      telemetryEligible: true
     });
   }
 
-  function endConversation(id) {
+  function touchConversation(id) {
     const record = conversationRecords.get(id);
-    if (record && !record.endedAt) record.endedAt = Date.now();
+    if (record) record.lastActivityAt = Date.now();
+    return record;
+  }
+
+  function markResponseStarted(id) {
+    const record = touchConversation(id);
+    if (record) record.responseStarted = true;
+  }
+
+  function markModelField(id, type) {
+    const record = touchConversation(id);
+    if (record && type === "server-model") {
+      record.serverModelSeen = true;
+      // Direct response evidence is authoritative. A later telemetry event
+      // must not be allowed to overwrite or be associated with this turn.
+      record.telemetryEligible = false;
+    }
+  }
+
+  function endConversation(id, details = {}) {
+    const record = conversationRecords.get(id);
+    if (record && !record.endedAt) {
+      record.endedAt = Date.now();
+      record.lastActivityAt = record.endedAt;
+      record.endReason = details.endReason || "completed";
+      record.responseFormat = details.responseFormat || "unknown";
+      record.telemetryEligible = !record.serverModelSeen;
+    }
     cleanupConversationRecords();
+    return record;
   }
 
   function telemetryRequestId() {
@@ -82,6 +115,7 @@
     cleanupConversationRecords(now);
 
     const candidates = [...conversationRecords.entries()].filter(([, record]) => {
+      if (!record.telemetryEligible || record.serverModelSeen) return false;
       const referenceTime = record.endedAt || record.startedAt;
       const window = record.endedAt
         ? TELEMETRY_ASSOCIATION_WINDOW_MS
@@ -96,9 +130,17 @@
     return candidates.length === 1 ? candidates[0][0] : null;
   }
 
-  function closeConversation(id) {
-    endConversation(id);
-    emit("response-end", { requestId: id });
+  function closeConversation(id, details = {}) {
+    const record = endConversation(id, details);
+    if (!record || record.responseEndEmitted) return;
+    record.responseEndEmitted = true;
+    emit("response-end", {
+      requestId: id,
+      endReason: record.endReason || details.endReason || "completed",
+      responseFormat: record.responseFormat || details.responseFormat || "unknown",
+      responseStarted: Boolean(record.responseStarted),
+      ...(details.stats || {})
+    });
   }
 
   function emit(type, payload = {}) {
@@ -239,13 +281,21 @@
     // accidentally attach to whichever turn is currently visible.
     if (!targetRequestId) return;
 
+    markModelField(targetRequestId, type);
+
     emit(type, {
       requestId: targetRequestId,
       value: cleaned
     });
   }
 
-  function inspectObject(value, requestIdValue, depth = 0, seen = new WeakSet(), budget = { count: 0 }) {
+  function inspectObject(
+    value,
+    requestIdValue,
+    depth = 0,
+    seen = new WeakSet(),
+    budget = { count: 0 }
+  ) {
     if (value == null || depth > MAX_SCAN_DEPTH || budget.count >= MAX_SCAN_NODES) return;
 
     if (typeof value === "string") {
@@ -257,7 +307,13 @@
           text.includes("resolved_model_slug"))
       ) {
         try {
-          inspectObject(JSON.parse(text), requestIdValue, depth + 1, seen, budget);
+          inspectObject(
+            JSON.parse(text),
+            requestIdValue,
+            depth + 1,
+            seen,
+            budget
+          );
         } catch {
           // This may be ordinary streamed text; it is intentionally ignored.
         }
@@ -333,7 +389,13 @@
       // traversed or interpreted.
       if (SKIP_RECURSION_KEYS.has(String(key).toLowerCase())) continue;
       if (budget.count >= MAX_SCAN_NODES) break;
-      inspectObject(child, requestIdValue, depth + 1, seen, budget);
+      inspectObject(
+        child,
+        requestIdValue,
+        depth + 1,
+        seen,
+        budget
+      );
     }
   }
 
@@ -388,37 +450,81 @@
     }
   }
 
-  function parseJSONCandidate(text, requestIdValue) {
+  function createResponseStats(formatHint = "unknown") {
+    return {
+      responseFormat: formatHint,
+      payloadCount: 0,
+      parseErrorCount: 0,
+      eventCount: 0,
+      byteCount: 0,
+      sawDone: false,
+      sawSseField: formatHint === "sse",
+      sawJson: formatHint === "json"
+    };
+  }
+
+  function parseJSONCandidate(
+    text,
+    requestIdValue,
+    stats
+  ) {
     if (!text || typeof text !== "string") return false;
 
     let value = text.trim();
-    if (!value || value === "[DONE]") return Boolean(value);
+    if (!value) return false;
+    if (value === "[DONE]") {
+      stats.sawDone = true;
+      return true;
+    }
     if (value.startsWith("data:")) value = value.slice(5).trim();
-    if (!value || value === "[DONE]") return Boolean(value);
+    if (!value) return false;
+    if (value === "[DONE]") {
+      stats.sawDone = true;
+      return true;
+    }
 
     try {
-      inspectObject(JSON.parse(value), requestIdValue);
+      inspectObject(JSON.parse(value), requestIdValue, 0, new WeakSet(), {
+        count: 0
+      });
+      stats.payloadCount += 1;
+      stats.sawJson = true;
+      if (stats.responseFormat === "unknown") stats.responseFormat = "json";
       return true;
     } catch {
       // Ignore non-JSON stream fragments; do not inspect or forward them.
+      stats.parseErrorCount += 1;
       return false;
     }
   }
 
-  function createStreamParser(requestIdValue) {
+  function createStreamParser(
+    requestIdValue,
+    formatHint = "unknown"
+  ) {
     let lineBuffer = "";
     let eventData = [];
     let rawJson = "";
+    const stats = createResponseStats(formatHint);
 
     function finishRawJson(force = false) {
       if (!rawJson) return;
-      const complete = parseJSONCandidate(rawJson, requestIdValue);
+      const complete = parseJSONCandidate(
+        rawJson,
+        requestIdValue,
+        stats
+      );
       if (complete || force) rawJson = "";
     }
 
     function finishEvent() {
       if (eventData.length) {
-        parseJSONCandidate(eventData.join("\n"), requestIdValue);
+        stats.eventCount += 1;
+        parseJSONCandidate(
+          eventData.join("\n"),
+          requestIdValue,
+          stats
+        );
         eventData = [];
       }
       finishRawJson(true);
@@ -434,6 +540,8 @@
       // SSE comments and fields which do not carry model data are ignored.
       if (line.startsWith(":")) return;
       if (line.startsWith("event:")) {
+        stats.sawSseField = true;
+        if (stats.responseFormat === "unknown") stats.responseFormat = "sse";
         // Be tolerant of servers that omit the usual blank line between
         // events: a new event field closes the prior data envelope.
         if (eventData.length) finishEvent();
@@ -443,20 +551,33 @@
         line.startsWith("id:") ||
         line.startsWith("retry:")
       ) {
+        stats.sawSseField = true;
+        if (stats.responseFormat === "unknown") stats.responseFormat = "sse";
         return;
       }
 
       if (line.startsWith("data:")) {
+        stats.sawSseField = true;
+        if (stats.responseFormat === "unknown") stats.responseFormat = "sse";
         finishRawJson(true);
         const piece = line.slice(5).trimStart();
 
         // Parse complete data lines immediately. If a JSON value is split
         // across data lines, retain the pieces and retry after each append.
-        if (!eventData.length && parseJSONCandidate(piece, requestIdValue)) {
+        if (
+          !eventData.length &&
+          parseJSONCandidate(piece, requestIdValue, stats)
+        ) {
           return;
         }
         eventData.push(piece);
-        if (parseJSONCandidate(eventData.join("\n"), requestIdValue)) {
+        if (
+          parseJSONCandidate(
+            eventData.join("\n"),
+            requestIdValue,
+            stats
+          )
+        ) {
           eventData = [];
         }
         if (eventData.join("\n").length > STREAM_BUFFER_LIMIT) {
@@ -465,15 +586,23 @@
         return;
       }
 
-      if (line.startsWith("{") || line.startsWith("[")) {
+      // A non-SSE JSON response may be pretty-printed, so once a JSON object
+      // starts, retain subsequent lines until the complete value parses.
+      if (rawJson || line.startsWith("{") || line.startsWith("[")) {
+        if (stats.responseFormat === "unknown") stats.responseFormat = "json";
         rawJson = rawJson ? `${rawJson}\n${line}` : line;
-        if (parseJSONCandidate(rawJson, requestIdValue)) rawJson = "";
+        if (parseJSONCandidate(rawJson, requestIdValue, stats)) {
+          rawJson = "";
+        }
         if (rawJson.length > STREAM_BUFFER_LIMIT) rawJson = "";
       }
     }
 
     function push(text, final = false) {
-      if (typeof text === "string" && text) lineBuffer += text;
+      if (typeof text === "string" && text) {
+        lineBuffer += text;
+        stats.byteCount += text.length;
+      }
 
       while (lineBuffer) {
         let index = -1;
@@ -513,38 +642,139 @@
       }
     }
 
-    return { push };
+    return { push, stats };
   }
 
-  function scanWholeText(text, requestIdValue) {
-    if (!text || typeof text !== "string") return;
-    const parser = createStreamParser(requestIdValue);
+  function scanWholeText(text, requestIdValue, options = {}) {
+    const formatHint = options.formatHint || "unknown";
+    if (!text || typeof text !== "string") {
+      return createResponseStats(formatHint);
+    }
+
+    // Parse a complete JSON response directly first. This also handles
+    // pretty-printed JSON that has no line-oriented framing.
+    const stats = createResponseStats(formatHint);
+    stats.byteCount = text.length;
+    const trimmed = text.trim();
+    if (
+      text.length <= STREAM_BUFFER_LIMIT &&
+      (trimmed.startsWith("{") || trimmed.startsWith("["))
+    ) {
+      try {
+        inspectObject(JSON.parse(trimmed), requestIdValue, 0, new WeakSet(), {
+          count: 0
+        });
+        stats.payloadCount = 1;
+        stats.sawJson = true;
+        stats.responseFormat = "json";
+        return stats;
+      } catch {
+        // It may be an SSE stream whose complete body is not one JSON value.
+        stats.parseErrorCount += 1;
+      }
+    }
+
+    const parser = createStreamParser(requestIdValue, formatHint);
     parser.push(text, true);
+    parser.stats.byteCount = Math.max(parser.stats.byteCount, stats.byteCount);
+    return parser.stats;
+  }
+
+  function responseFormatHint(response) {
+    try {
+      const contentType = response && response.headers
+        ? String(response.headers.get("content-type") || "").toLowerCase()
+        : "";
+      if (contentType.includes("text/event-stream")) return "sse";
+      if (contentType.includes("application/json")) return "json";
+    } catch {
+      // Some test doubles and older XHR wrappers do not expose headers.
+    }
+    return "unknown";
+  }
+
+  function compactStats(stats) {
+    const source = stats || createResponseStats("unknown");
+    return {
+      payloadCount: Number.isFinite(source.payloadCount)
+        ? Math.min(Math.max(source.payloadCount, 0), 100000)
+        : 0,
+      parseErrorCount: Number.isFinite(source.parseErrorCount)
+        ? Math.min(Math.max(source.parseErrorCount, 0), 100000)
+        : 0,
+      eventCount: Number.isFinite(source.eventCount)
+        ? Math.min(Math.max(source.eventCount, 0), 100000)
+        : 0,
+      sawDone: Boolean(source.sawDone),
+      responseUnsupported: Boolean(
+        (source.responseFormat === "unknown" ||
+          (source.responseFormat === "json" && source.parseErrorCount > 0)) &&
+          source.byteCount > 0 &&
+          source.payloadCount === 0
+      )
+    };
+  }
+
+  function networkFailureReason(error, fallback) {
+    try {
+      return error && error.name === "AbortError" ? "aborted" : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   async function watchStream(response, requestIdValue) {
+    const formatHint = responseFormatHint(response);
+    let parser = null;
+    if (response) {
+      markResponseStarted(requestIdValue);
+      emit("response-start", {
+        requestId: requestIdValue,
+        responseFormat: formatHint
+      });
+    }
+
     try {
       if (!response || !response.body) {
-        scanWholeText(await response.text(), requestIdValue);
-        closeConversation(requestIdValue);
+        const text = response && typeof response.text === "function"
+          ? await response.text()
+          : "";
+        const stats = scanWholeText(text, requestIdValue, { formatHint });
+        closeConversation(requestIdValue, {
+          endReason: "completed",
+          responseFormat: stats.responseFormat || formatHint,
+          stats: compactStats(stats)
+        });
         return;
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      const parser = createStreamParser(requestIdValue);
+      parser = createStreamParser(requestIdValue, formatHint);
 
       while (true) {
         const result = await reader.read();
         if (result.done) break;
-        parser.push(decoder.decode(result.value, { stream: true }));
+        parser.push(
+          typeof result.value === "string"
+            ? result.value
+            : decoder.decode(result.value, { stream: true })
+        );
       }
 
       parser.push(decoder.decode(), true);
-      closeConversation(requestIdValue);
-    } catch {
+      closeConversation(requestIdValue, {
+        endReason: "completed",
+        responseFormat: parser.stats.responseFormat,
+        stats: compactStats(parser.stats)
+      });
+    } catch (error) {
       // Reading a clone can fail if the page cancels/navigation closes it.
-      closeConversation(requestIdValue);
+      closeConversation(requestIdValue, {
+        endReason: networkFailureReason(error, "read-error"),
+        responseFormat: parser && parser.stats.responseFormat,
+        stats: parser && compactStats(parser.stats)
+      });
     }
   }
 
@@ -554,6 +784,50 @@
         (input && input.method) ||
         "GET"
     ).toUpperCase();
+  }
+
+  function xhrResponseFormatHint(xhr) {
+    try {
+      if (xhr.responseType === "json") return "json";
+    } catch {
+      // Accessing responseType can fail on an unusual host object.
+    }
+    return "unknown";
+  }
+
+  async function scanXHRResponse(xhr, requestIdValue, formatHint) {
+    let responseType = "";
+    try {
+      responseType = xhr.responseType || "";
+    } catch {
+      responseType = "";
+    }
+
+    if (responseType === "json") {
+      const stats = createResponseStats("json");
+      try {
+        if (xhr.response && typeof xhr.response === "object") {
+          inspectObject(xhr.response, requestIdValue);
+          stats.payloadCount = 1;
+        }
+      } catch {
+        stats.parseErrorCount = 1;
+      }
+      return stats;
+    }
+
+    if (responseType === "blob" || responseType === "arraybuffer") {
+      const text = await bodyToText(xhr.response);
+      return scanWholeText(text, requestIdValue, { formatHint });
+    }
+
+    let text = "";
+    try {
+      text = xhr.responseText || "";
+    } catch {
+      text = "";
+    }
+    return scanWholeText(text, requestIdValue, { formatHint });
   }
 
   function wrapFetch() {
@@ -572,7 +846,10 @@
         captureRequestAsync(id, input, init);
       } else if (telemetry) {
         requestBodyText(input, init)
-          .then((text) => scanWholeText(text, telemetryRequestId()))
+          .then((text) => {
+            const requestIdValue = telemetryRequestId();
+            scanWholeText(text, requestIdValue);
+          })
           .catch(() => {});
       }
 
@@ -580,7 +857,11 @@
       try {
         result = nativeFetch.apply(this, arguments);
       } catch (error) {
-        if (conversation) closeConversation(id);
+        if (conversation) {
+          closeConversation(id, {
+            endReason: networkFailureReason(error, "fetch-error")
+          });
+        }
         throw error;
       }
 
@@ -590,15 +871,29 @@
         (response) => {
           try {
             watchStream(response.clone(), id);
-          } catch {
-            closeConversation(id);
+          } catch (error) {
+            // The page may have consumed or locked the response before the
+            // clone was made. A response did arrive, so report this as an
+            // interrupted read rather than as a missing response.
+            if (response) {
+              markResponseStarted(id);
+              emit("response-start", {
+                requestId: id,
+                responseFormat: responseFormatHint(response)
+              });
+            }
+            closeConversation(id, {
+              endReason: networkFailureReason(error, "read-error")
+            });
           }
           return response;
         },
         (error) => {
           // Preserve the page's original rejection semantics while closing
           // the detector's turn so its UI cannot remain in "checking".
-          closeConversation(id);
+          closeConversation(id, {
+            endReason: networkFailureReason(error, "fetch-error")
+          });
           throw error;
         }
       );
@@ -656,27 +951,85 @@
           })
           .catch(() => {});
 
+        let responseStartedEmitted = false;
+        const markXHRResponseStarted = () => {
+          if (responseStartedEmitted) return;
+          responseStartedEmitted = true;
+          markResponseStarted(id);
+          emit("response-start", {
+            requestId: id,
+            responseFormat: xhrResponseFormatHint(this)
+          });
+        };
+
         this.addEventListener(
-          "loadend",
+          "readystatechange",
           () => {
             try {
-              if (!this.responseType || this.responseType === "text") {
-                scanWholeText(this.responseText, id);
+              if (this.readyState >= 2) markXHRResponseStarted();
+            } catch {
+              // Ignore host object access failures.
+            }
+          }
+        );
+
+        this.addEventListener(
+          "loadend",
+          async () => {
+            const responseType = (() => {
+              try {
+                return this.responseType || "";
+              } catch {
+                return "";
+              }
+            })();
+            let hasResponse = false;
+            try {
+              hasResponse = Boolean(
+                this.response ||
+                this.responseText ||
+                this.status >= 200
+              );
+            } catch {
+              hasResponse = false;
+            }
+
+            if (hasResponse) markXHRResponseStarted();
+
+            try {
+              if (hasResponse) {
+                const formatHint = xhrResponseFormatHint(this);
+                const stats = await scanXHRResponse(this, id, formatHint);
+                closeConversation(id, {
+                  endReason: "completed",
+                  responseFormat: stats.responseFormat || formatHint,
+                  stats: compactStats(stats)
+                });
+              } else {
+                closeConversation(id, { endReason: "interrupted" });
               }
             } catch {
               // Response may be binary or inaccessible.
+              closeConversation(id, { endReason: "read-error" });
             }
-            closeConversation(id);
           },
           { once: true }
         );
       } else if (telemetry) {
         bodyToText(body)
-          .then((text) => scanWholeText(text, telemetryRequestId()))
+          .then((text) => {
+            const requestIdValue = telemetryRequestId();
+            scanWholeText(text, requestIdValue);
+          })
           .catch(() => {});
       }
 
-      return nativeSend.apply(this, arguments);
+      try {
+        return nativeSend.apply(this, arguments);
+      } catch (error) {
+        if (conversation) closeConversation(id, { endReason: "fetch-error" });
+        throw error;
+      }
     };
   }
 
@@ -688,7 +1041,10 @@
       navigator.sendBeacon = function routeCheckerBeacon(url, data) {
         if (isTelemetry(url, "POST")) {
           bodyToText(data)
-            .then((text) => scanWholeText(text, telemetryRequestId()))
+            .then((text) => {
+              const requestIdValue = telemetryRequestId();
+              scanWholeText(text, requestIdValue);
+            })
             .catch(() => {});
         }
         return nativeBeacon(url, data);

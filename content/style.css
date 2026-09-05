@@ -112,6 +112,13 @@
   font-size: 12px;
 }
 
+.route-diagnostic {
+  margin: -3px 0 9px;
+  color: #71717a;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 .route-fields {
   display: grid;
   gap: 7px;
@@ -207,6 +214,10 @@
   .route-reason,
   .route-field-label {
     color: #b7b7c1;
+  }
+
+  .route-diagnostic {
+    color: #8d8d99;
   }
 
   .route-reason,

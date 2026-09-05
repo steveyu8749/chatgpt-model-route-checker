@@ -21,6 +21,7 @@ const rules = fs.readFileSync(
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 
 assert.equal(manifest.manifest_version, 3);
+assert.equal(manifest.version, "1.1.0");
 assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"]);
 assert.equal(manifest.content_scripts.length, 2);
 assert.deepEqual(manifest.web_accessible_resources, [
@@ -42,6 +43,10 @@ assert.match(detector, /XMLHttpRequest/);
 assert.match(detector, /server_ste_metadata/);
 assert.match(detector, /window\.postMessage/);
 assert.match(detector, /TELEMETRY_ASSOCIATION_WINDOW_MS/);
+assert.match(detector, /response-start/);
+assert.match(detector, /responseFormatHint/);
+assert.doesNotMatch(detector, /telemetryModelHints/);
+assert.match(detector, /endReason/);
 assert.match(detector, /createStreamParser/);
 for (const key of ["content", "parts", "messages", "attachments", "files", "prompt", "body"]) {
   assert.match(detector, new RegExp(`"${key}"`));
@@ -50,8 +55,12 @@ assert.doesNotMatch(detector, /chrome\.storage/);
 assert.doesNotMatch(detector, /localStorage/);
 assert.doesNotMatch(content, /chrome\.storage/);
 assert.match(content, /NETWORK_EVIDENCE_TYPES/);
+assert.match(content, /RESPONSE_WAIT_TIMEOUT_MS/);
 assert.match(content, /NETWORK_EVIDENCE_TYPES\.has\(data\.type\) && !eventId/);
 assert.match(content, /RESPONSE_END_GRACE_MS/);
+assert.match(content, /diagnosticSummary/);
+assert.match(content, /复制诊断/);
+assert.match(content, /UNAVAILABLE_LABELS/);
 assert.match(content, /未提供（可选）/);
 assert.match(content, /request\.model/);
 assert.match(content, /resolved_model_slug/);
@@ -60,6 +69,8 @@ assert.match(content, /getURL\("content\/style\.css"\)/);
 assert.match(rules, /equivalent: Object\.freeze\(\[\]\)/);
 assert.match(rules, /incompatible: Object\.freeze\(\[\]\)/);
 assert.match(readme, /不上传/);
+assert.match(readme, /未捕获响应/);
+assert.match(readme, /诊断摘要/);
 assert.match(readme, /不能证明 OpenAI GPU/);
 
 console.log("Static extension checks passed.");

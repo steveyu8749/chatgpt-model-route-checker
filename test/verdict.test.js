@@ -204,3 +204,103 @@ test("default rules contain no invented model mappings", () => {
   });
   assert.equal(unknown.status, verdict.STATUS.REVIEW);
 });
+
+test("unavailable reasons identify a missing request separately", () => {
+  const noRequest = verdict.classify({ complete: true });
+  const noModel = verdict.classify({
+    requestCaptured: true,
+    requestModel: null,
+    serverModel: null,
+    complete: true
+  });
+
+  assert.equal(
+    noRequest.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.NO_REQUEST
+  );
+  assert.match(noRequest.reason, /未捕获.*请求/);
+  assert.equal(
+    noModel.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING
+  );
+  assert.match(noModel.reason, /没有 request\.model/);
+});
+
+test("unavailable reasons identify response stages", () => {
+  const noResponse = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: false,
+    responseEndReason: "fetch-error",
+    complete: true
+  });
+  const noFields = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: true,
+    responseEnded: true,
+    responseEndReason: "completed",
+    complete: true
+  });
+  const interrupted = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: true,
+    responseEnded: true,
+    responseEndReason: "read-error",
+    complete: true
+  });
+  const unsupported = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: true,
+    responseEnded: true,
+    responseEndReason: "completed",
+    responseUnsupported: true,
+    complete: true
+  });
+
+  assert.equal(
+    noResponse.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED
+  );
+  assert.equal(
+    noFields.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS
+  );
+  assert.equal(
+    interrupted.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.RESPONSE_INTERRUPTED
+  );
+  assert.equal(
+    unsupported.unavailableReason,
+    verdict.UNAVAILABLE_REASONS.UNSUPPORTED_RESPONSE
+  );
+});
+
+test("checking reason follows the current request lifecycle stage", () => {
+  const waitingResponse = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: false,
+    complete: false
+  });
+  const waitingMetadata = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: true,
+    responseEnded: false,
+    complete: false
+  });
+  const waitingTelemetry = verdict.classify({
+    requestCaptured: true,
+    requestModel: "gpt-example",
+    responseStarted: true,
+    responseEnded: true,
+    complete: false
+  });
+
+  assert.match(waitingResponse.reason, /等待 ChatGPT 响应/);
+  assert.match(waitingMetadata.reason, /服务端模型/);
+  assert.match(waitingTelemetry.reason, /延迟.*元数据/);
+});

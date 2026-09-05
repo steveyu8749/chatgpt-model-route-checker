@@ -5,8 +5,11 @@
   const CHANNEL = "__CHATGPT_MODEL_ROUTE_CHECKER_V1__";
   const HOST_ID = "__chatgpt_model_route_checker_host__";
   const MAX_TURNS = 8;
-  const RESPONSE_END_GRACE_MS = 1500;
+  const RESPONSE_WAIT_TIMEOUT_MS = 30000;
+  const RESPONSE_END_GRACE_MS = 2500;
   const NETWORK_EVIDENCE_TYPES = new Set([
+    "response-start",
+    "response-progress",
     "server-model",
     "assistant-model",
     "resolved-model",
@@ -34,6 +37,7 @@
   function newTurn(id) {
     return {
       id,
+      requestCaptured: false,
       requestModel: null,
       serverModel: null,
       assistantModel: null,
@@ -42,7 +46,20 @@
       domModel: null,
       thinkingEffort: null,
       complete: false,
+      responseStarted: false,
+      responseEnded: false,
+      responseEndReason: null,
+      responseFormat: null,
+      responseUnsupported: false,
+      responseStats: {
+        payloadCount: 0,
+        parseErrorCount: 0,
+        eventCount: 0,
+        byteCount: 0,
+        sawDone: false
+      },
       completionTimer: null,
+      responseWaitTimer: null,
       startedAt: Date.now()
     };
   }
@@ -55,7 +72,15 @@
       turn = newTurn(id);
       turns.set(id, turn);
       while (turns.size > MAX_TURNS) {
-        turns.delete(turns.keys().next().value);
+        const oldestId = turns.keys().next().value;
+        const oldest = turns.get(oldestId);
+        if (oldest && oldest.completionTimer) {
+          window.clearTimeout(oldest.completionTimer);
+        }
+        if (oldest && oldest.responseWaitTimer) {
+          window.clearTimeout(oldest.responseWaitTimer);
+        }
+        turns.delete(oldestId);
       }
     }
     return turn;
@@ -77,6 +102,19 @@
       turn.complete = true;
       if (currentId === turn.id) render();
     }, RESPONSE_END_GRACE_MS);
+  }
+
+  function scheduleResponseWait(turn) {
+    if (!turn || turn.responseStarted || turn.responseEnded) return;
+    if (turn.responseWaitTimer) window.clearTimeout(turn.responseWaitTimer);
+    turn.responseWaitTimer = window.setTimeout(() => {
+      turn.responseWaitTimer = null;
+      if (turn.responseStarted || turn.responseEnded) return;
+      turn.responseEnded = true;
+      turn.responseEndReason = "no-response";
+      turn.complete = true;
+      if (currentId === turn.id) render();
+    }, RESPONSE_WAIT_TIMEOUT_MS);
   }
 
   function displayValue(value, waiting = false, optional = false) {
@@ -101,7 +139,13 @@
         assistantModel: turn.assistantModel,
         resolvedModel: turn.resolvedModel,
         domModel: turn.domModel,
-        complete: turn.complete
+        complete: turn.complete,
+        requestCaptured: turn.requestCaptured,
+        responseStarted: turn.responseStarted,
+        responseEnded: turn.responseEnded,
+        responseEndReason: turn.responseEndReason,
+        responseFormat: turn.responseFormat,
+        responseUnsupported: turn.responseUnsupported
       },
       { rules }
     );
@@ -158,6 +202,7 @@
     details.hidden = true;
 
     const reason = makeElement("p", "route-reason");
+    const diagnostic = makeElement("p", "route-diagnostic");
     const fields = makeElement("dl", "route-fields");
     fields.append(
       makeField("客户端 request.model", null),
@@ -175,11 +220,11 @@
       "route-note",
       "仅核对浏览器可见的模型路由元数据"
     );
-    const copy = makeElement("button", "route-copy", "复制结果");
+    const copy = makeElement("button", "route-copy", "复制诊断");
     copy.type = "button";
     footer.append(note, copy);
 
-    details.append(reason, fields, footer);
+    details.append(reason, diagnostic, fields, footer);
     card.append(summary, details);
     shadow.appendChild(card);
 
@@ -198,7 +243,7 @@
       const copied = await copyText(text);
       copy.textContent = copied ? "已复制" : "复制失败";
       window.setTimeout(() => {
-        copy.textContent = "复制结果";
+        copy.textContent = "复制诊断";
       }, 1600);
     });
 
@@ -210,24 +255,88 @@
       line,
       details,
       reason,
+      diagnostic,
       fields,
       copy
     };
+  }
+
+  function safeCount(value) {
+    return Number.isFinite(value) && value >= 0
+      ? Math.min(Math.floor(value), 100000)
+      : 0;
+  }
+
+  function responseReasonLabel(reason) {
+    const labels = {
+      completed: "正常结束",
+      "fetch-error": "请求失败",
+      "read-error": "读取失败",
+      interrupted: "请求被中断",
+      aborted: "请求被取消",
+      "no-response": "未收到响应"
+    };
+    return labels[reason] || (reason ? "未知结束原因" : "尚未结束");
+  }
+
+  function responseFormatLabel(format) {
+    const labels = {
+      sse: "SSE 流",
+      json: "JSON",
+      unknown: "未知"
+    };
+    return labels[format] || "未知";
+  }
+
+  function diagnosticSummary(turn) {
+    if (!turn) return "尚未捕获本轮请求。";
+
+    const stats = turn.responseStats || {};
+    const requestState = turn.requestCaptured
+      ? turn.requestModel
+        ? "已捕获，模型已获取"
+        : "已捕获，模型未获取"
+      : "未捕获";
+    const responseState = turn.responseStarted
+      ? turn.responseEnded
+        ? `已捕获，${responseReasonLabel(turn.responseEndReason)}`
+        : "已捕获，仍在接收"
+      : turn.responseEnded
+        ? `未捕获，${responseReasonLabel(turn.responseEndReason)}`
+        : "未捕获，等待中";
+
+    return [
+      `请求：${requestState}`,
+      `响应：${responseState}`,
+      `格式：${responseFormatLabel(turn.responseFormat)}`,
+      `事件：${safeCount(stats.eventCount)}，JSON 载荷：${safeCount(
+        stats.payloadCount
+      )}，解析异常：${safeCount(stats.parseErrorCount)}`
+    ].join("；");
   }
 
   function formatCopyText(turn, result) {
     const current = turn || {};
     const optional = (value) => value || "未提供（可选）";
     return [
-      `状态：${result.label}`,
+      `状态：${displayStatusLabel(result)}`,
       `判定理由：${result.reason}`,
+      `不可用原因：${
+        result.unavailableReason || "不适用"
+      }`,
+      `诊断摘要：${diagnosticSummary(turn)}`,
       `客户端 request.model：${current.requestModel || "未获取"}`,
       `服务端 server_ste_metadata.model_slug：${current.serverModel || "未获取"}`,
       `assistant metadata.model_slug：${optional(current.assistantModel)}`,
       `resolved_model_slug：${optional(current.resolvedModel)}`,
       `requested_model_experience：${optional(current.requestedExperience)}`,
       `DOM data-message-model-slug：${optional(current.domModel)}`,
-      `request.thinking_effort：${optional(current.thinkingEffort)}`
+      `request.thinking_effort：${optional(current.thinkingEffort)}`,
+      `响应格式：${responseFormatLabel(current.responseFormat)}`,
+      `响应结束原因：${responseReasonLabel(current.responseEndReason)}`,
+      `响应事件数：${safeCount(current.responseStats?.eventCount)}`,
+      `JSON 载荷数：${safeCount(current.responseStats?.payloadCount)}`,
+      `解析异常数：${safeCount(current.responseStats?.parseErrorCount)}`
     ].join("\n");
   }
 
@@ -263,9 +372,12 @@
     const turn = currentTurn();
     const result = resultForTurn(turn);
     ui.host.dataset.status = result.status;
-    ui.status.textContent = `${statusIcon(result.status)} ${result.label}`;
+    ui.status.textContent = `${statusIcon(result.status)} ${displayStatusLabel(
+      result
+    )}`;
     ui.line.textContent = modelLine(result);
     ui.reason.textContent = result.reason;
+    ui.diagnostic.textContent = `诊断：${diagnosticSummary(turn)}`;
     ui.summary.title = result.reason;
 
     const fields = [
@@ -281,6 +393,19 @@
     ui.fields.replaceChildren(
       ...fields.map(([label, value, optional]) => makeField(label, value, optional))
     );
+  }
+
+  function displayStatusLabel(result) {
+    if (
+      result &&
+      result.status === api.STATUS.UNAVAILABLE &&
+      result.unavailableReason &&
+      api.UNAVAILABLE_LABELS &&
+      api.UNAVAILABLE_LABELS[result.unavailableReason]
+    ) {
+      return api.UNAVAILABLE_LABELS[result.unavailableReason];
+    }
+    return result ? result.label : api.LABELS[api.STATUS.IDLE];
   }
 
   function statusIcon(status) {
@@ -329,6 +454,8 @@
 
       // The bridge can send a second request event after cloning a Request.
       // Keep response evidence already collected for this same turn.
+      turn.requestCaptured = true;
+      scheduleResponseWait(turn);
       if (typeof data.model === "string") {
         const model = clean(data.model);
         if (model) turn.requestModel = model;
@@ -353,6 +480,28 @@
 
     const value = clean(data.value);
     switch (data.type) {
+      case "response-start":
+        if (turn.responseWaitTimer) {
+          window.clearTimeout(turn.responseWaitTimer);
+          turn.responseWaitTimer = null;
+        }
+        turn.responseStarted = true;
+        turn.responseFormat = clean(data.responseFormat, 40) || "unknown";
+        turn.responseEnded = false;
+        turn.responseEndReason = null;
+        turn.responseUnsupported = false;
+        turn.complete = false;
+        if (turn.completionTimer) {
+          window.clearTimeout(turn.completionTimer);
+          turn.completionTimer = null;
+        }
+        break;
+      case "response-progress":
+        if (typeof data.responseFormat === "string") {
+          turn.responseFormat = clean(data.responseFormat, 40) || turn.responseFormat;
+        }
+        updateResponseStats(turn, data);
+        break;
       case "server-model":
         turn.serverModel = value;
         break;
@@ -372,6 +521,20 @@
         turn.thinkingEffort = value;
         break;
       case "response-end":
+        if (turn.responseWaitTimer) {
+          window.clearTimeout(turn.responseWaitTimer);
+          turn.responseWaitTimer = null;
+        }
+        turn.responseEnded = true;
+        turn.responseEndReason = clean(data.endReason, 80) || "completed";
+        turn.responseStarted =
+          typeof data.responseStarted === "boolean"
+            ? data.responseStarted
+            : turn.responseStarted;
+        turn.responseFormat =
+          clean(data.responseFormat, 40) || turn.responseFormat || "unknown";
+        turn.responseUnsupported = Boolean(data.responseUnsupported);
+        updateResponseStats(turn, data);
         scheduleCompletion(turn);
         break;
       default:
@@ -383,6 +546,22 @@
     // away from the newest request.
     if (!currentId && eventId) currentId = eventId;
     if (wasCurrent) render();
+  }
+
+  function updateResponseStats(turn, data) {
+    if (!turn || !data) return;
+    const stats = turn.responseStats || (turn.responseStats = {});
+    for (const key of [
+      "payloadCount",
+      "parseErrorCount",
+      "eventCount",
+      "byteCount"
+    ]) {
+      if (Number.isFinite(data[key])) {
+        stats[key] = Math.min(Math.max(Math.floor(data[key]), 0), 100000);
+      }
+    }
+    if (typeof data.sawDone === "boolean") stats.sawDone = data.sawDone;
   }
 
   function lastAssistantNode() {

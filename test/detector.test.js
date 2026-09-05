@@ -45,10 +45,10 @@ function makeContext(responseText, fetchImpl, options = {}) {
   };
 
   // Browser globals referenced without `window.` in MAIN-world code.
-  context.XMLHttpRequest = undefined;
+  context.XMLHttpRequest = options.XMLHttpRequest;
   context.globalThis = context;
   vm.runInNewContext(detectorSource, context, { filename: "detector.js" });
-  return { window, messages };
+  return { window, messages, context };
 }
 
 test("fetch bridge emits model evidence without forwarding message content", async () => {
@@ -102,6 +102,17 @@ test("fetch bridge emits model evidence without forwarding message content", asy
     messages.find((message) => message.type === "request").thinkingEffort,
     "medium"
   );
+  const responseStart = messages.find(
+    (message) => message.type === "response-start"
+  );
+  const responseEnd = messages.find(
+    (message) => message.type === "response-end"
+  );
+  assert.equal(responseStart.responseFormat, "sse");
+  assert.equal(responseEnd.responseStarted, true);
+  assert.equal(responseEnd.responseFormat, "sse");
+  assert.ok(responseEnd.payloadCount >= 2);
+  assert.equal(responseEnd.responseUnsupported, false);
 });
 
 test("non-ChatGPT URLs are not intercepted", async () => {
@@ -129,7 +140,168 @@ test("a rejected native fetch closes the turn while preserving rejection", async
   );
 
   assert.ok(messages.some((message) => message.type === "request"));
-  assert.ok(messages.some((message) => message.type === "response-end"));
+  const end = messages.find((message) => message.type === "response-end");
+  assert.equal(end.endReason, "fetch-error");
+  assert.equal(end.responseStarted, false);
+});
+
+test("ordinary JSON responses and conversation path variants are detected", async () => {
+  const response = new Response(
+    JSON.stringify({
+      server_ste_metadata: { model_slug: "gpt-json" },
+      resolved_model_slug: "gpt-json"
+    }),
+    { headers: { "content-type": "application/json" } }
+  );
+  const { window, messages } = makeContext("", async () => response);
+
+  await window.fetch(
+    "https://chatgpt.com/backend-api/conversation/continue?stream=1",
+    {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-json" })
+    }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const start = messages.find((message) => message.type === "response-start");
+  const end = messages.find((message) => message.type === "response-end");
+  assert.equal(start.responseFormat, "json");
+  assert.equal(end.responseFormat, "json");
+  assert.equal(end.responseStarted, true);
+  assert.equal(end.responseUnsupported, false);
+  assert.equal(
+    messages.find((message) => message.type === "server-model").value,
+    "gpt-json"
+  );
+});
+
+test("XHR JSON responses are captured with the same per-request evidence", async () => {
+  class FakeXMLHttpRequest {
+    constructor() {
+      this.listeners = new Map();
+      this.readyState = 0;
+      this.status = 200;
+      this.responseType = "";
+      this.responseText = JSON.stringify({
+        server_ste_metadata: { model_slug: "gpt-xhr" }
+      });
+    }
+
+    addEventListener(type, callback) {
+      const callbacks = this.listeners.get(type) || [];
+      callbacks.push(callback);
+      this.listeners.set(type, callbacks);
+    }
+
+    dispatch(type) {
+      for (const callback of this.listeners.get(type) || []) callback.call(this);
+    }
+
+    open(method, url) {
+      this.method = method;
+      this.url = url;
+    }
+
+    send() {
+      this.readyState = 2;
+      this.dispatch("readystatechange");
+      this.readyState = 4;
+      this.dispatch("readystatechange");
+      this.dispatch("loadend");
+    }
+  }
+
+  const { context, messages } = makeContext("", null, {
+    XMLHttpRequest: FakeXMLHttpRequest
+  });
+  const xhr = new context.XMLHttpRequest();
+  xhr.open(
+    "POST",
+    "https://chatgpt.com/backend-api/f/conversation/regenerate"
+  );
+  xhr.send(JSON.stringify({ model: "gpt-xhr" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.ok(messages.some((message) => message.type === "request"));
+  assert.ok(messages.some((message) => message.type === "response-start"));
+  assert.equal(
+    messages.find((message) => message.type === "server-model").value,
+    "gpt-xhr"
+  );
+  assert.equal(
+    messages.find((message) => message.type === "response-end").endReason,
+    "completed"
+  );
+});
+
+test("a stream read failure reports an interrupted response", async () => {
+  const { window, messages } = makeContext("", async () => ({
+    headers: { get: () => "text/event-stream" },
+    clone() {
+      return {
+        headers: this.headers,
+        body: {
+          getReader() {
+            return {
+              read() {
+                return Promise.reject(new Error("stream interrupted"));
+              }
+            };
+          }
+        }
+      };
+    }
+  }));
+
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-interrupted" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const end = messages.find((message) => message.type === "response-end");
+  assert.equal(end.endReason, "read-error");
+  assert.equal(end.responseStarted, true);
+});
+
+test("a consumed response is reported as an interrupted received response", async () => {
+  const { window, messages } = makeContext("", async () => ({
+    headers: { get: () => "text/event-stream" },
+    clone() {
+      throw new Error("body already used");
+    }
+  }));
+
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-consumed" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const start = messages.find((message) => message.type === "response-start");
+  const end = messages.find((message) => message.type === "response-end");
+  assert.ok(start);
+  assert.equal(end.endReason, "read-error");
+  assert.equal(end.responseStarted, true);
+});
+
+test("an unrecognized non-empty response is reported as unsupported format", async () => {
+  const response = new Response("not-json-or-sse", {
+    headers: { "content-type": "text/plain" }
+  });
+  const { window, messages } = makeContext("", async () => response);
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-unsupported" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const end = messages.find((message) => message.type === "response-end");
+  assert.equal(end.responseStarted, true);
+  assert.equal(end.responseFormat, "unknown");
+  assert.equal(end.responseUnsupported, true);
+  assert.equal(end.payloadCount, 0);
 });
 
 test("incremental SSE chunks split inside JSON lines still emit all model fields", async () => {
@@ -240,6 +412,26 @@ test("telemetry is associated only when one recent conversation is unambiguous",
   assert.ok(request);
   assert.ok(telemetryModel);
   assert.equal(telemetryModel.requestId, request.requestId);
+});
+
+test("ordinary telemetry metadata.model_slug is not promoted to server evidence", async () => {
+  const { window, messages } = makeContext("{}");
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-ordinary-metadata" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  await window.fetch("https://chatgpt.com/ces/v1/telemetry/intake", {
+    method: "POST",
+    body: JSON.stringify({ metadata: { model_slug: "gpt-ordinary-metadata" } })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.equal(
+    messages.some((message) => message.type === "server-model"),
+    false
+  );
 });
 
 test("ambiguous telemetry is dropped instead of entering either recent turn", async () => {

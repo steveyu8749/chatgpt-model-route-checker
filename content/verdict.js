@@ -20,6 +20,27 @@
     UNAVAILABLE: "unavailable"
   });
 
+  // These reasons describe where an otherwise valid turn stopped producing
+  // evidence. They are deliberately separate from STATUS.UNAVAILABLE so the
+  // UI can explain a failure without treating it as a model mismatch.
+  const UNAVAILABLE_REASONS = Object.freeze({
+    NO_REQUEST: "no-request",
+    REQUEST_MODEL_MISSING: "request-model-missing",
+    RESPONSE_NOT_CAPTURED: "response-not-captured",
+    RESPONSE_NO_FIELDS: "response-no-fields",
+    RESPONSE_INTERRUPTED: "response-interrupted",
+    UNSUPPORTED_RESPONSE: "unsupported-response"
+  });
+
+  const UNAVAILABLE_LABELS = Object.freeze({
+    [UNAVAILABLE_REASONS.NO_REQUEST]: "未捕获请求",
+    [UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING]: "请求无模型",
+    [UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED]: "未捕获响应",
+    [UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS]: "响应无模型",
+    [UNAVAILABLE_REASONS.RESPONSE_INTERRUPTED]: "响应中断",
+    [UNAVAILABLE_REASONS.UNSUPPORTED_RESPONSE]: "格式不支持"
+  });
+
   const LABELS = Object.freeze({
     [STATUS.IDLE]: "模型检测",
     [STATUS.CHECKING]: "检测中",
@@ -27,6 +48,20 @@
     [STATUS.MISMATCH]: "模型不对应",
     [STATUS.REVIEW]: "待确认",
     [STATUS.UNAVAILABLE]: "无法检测"
+  });
+
+  const REASON_TEXT = Object.freeze({
+    [UNAVAILABLE_REASONS.NO_REQUEST]: "未捕获到 ChatGPT 对话请求。",
+    [UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING]:
+      "已捕获对话请求，但请求中没有 request.model。",
+    [UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED]:
+      "已捕获请求，但未捕获到对应的响应。",
+    [UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS]:
+      "响应已结束，但没有提供服务端模型字段。",
+    [UNAVAILABLE_REASONS.RESPONSE_INTERRUPTED]:
+      "响应在读取过程中被中断，未能完成模型字段采集。",
+    [UNAVAILABLE_REASONS.UNSUPPORTED_RESPONSE]:
+      "已收到响应，但其格式暂不支持解析。"
   });
 
   function clean(value, maxLength = 200) {
@@ -87,6 +122,57 @@
     return auxiliary.some((value) => value !== serverModel);
   }
 
+  function unavailableReason(evidence, requestModel, serverModel) {
+    if (!requestModel) {
+      return evidence.requestCaptured
+        ? UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING
+        : UNAVAILABLE_REASONS.NO_REQUEST;
+    }
+
+    if (serverModel) return null;
+
+    const endReason = clean(evidence.responseEndReason, 80);
+    if (!evidence.responseStarted) {
+      return UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED;
+    }
+
+    if (
+      endReason === "read-error" ||
+      endReason === "aborted" ||
+      endReason === "interrupted"
+    ) {
+      return UNAVAILABLE_REASONS.RESPONSE_INTERRUPTED;
+    }
+
+    if (evidence.responseUnsupported) {
+      return UNAVAILABLE_REASONS.UNSUPPORTED_RESPONSE;
+    }
+
+    return UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS;
+  }
+
+  function checkingReason(evidence, requestModel, serverModel) {
+    if (
+      Object.prototype.hasOwnProperty.call(evidence, "requestCaptured") &&
+      !evidence.requestCaptured &&
+      !requestModel
+    ) {
+      return "正在等待捕获 ChatGPT 对话请求。";
+    }
+    if (!requestModel) return "已捕获请求，正在确认 request.model。";
+    if (
+      Object.prototype.hasOwnProperty.call(evidence, "responseStarted") &&
+      !evidence.responseStarted
+    ) {
+      return "已捕获请求，正在等待 ChatGPT 响应。";
+    }
+    if (serverModel) return "正在核对服务端模型路由元数据。";
+    if (evidence.responseEnded) {
+      return "响应已结束，正在等待延迟到达的模型元数据。";
+    }
+    return "已捕获响应，正在等待服务端模型路由元数据。";
+  }
+
   function classify(input = {}, options = {}) {
     const evidence = input || {};
     const requestModel = normalizeModel(evidence.requestModel);
@@ -97,12 +183,16 @@
     const uniqueAuxiliary = [...new Set(auxiliary)];
 
     if (!requestModel || !serverModel) {
+      const reasonCode = complete
+        ? unavailableReason(evidence, requestModel, serverModel)
+        : null;
       return {
         status: complete ? STATUS.UNAVAILABLE : STATUS.CHECKING,
         label: LABELS[complete ? STATUS.UNAVAILABLE : STATUS.CHECKING],
-        reason: !requestModel
-          ? "未取得客户端请求模型。"
-          : "尚未取得服务端模型路由元数据。",
+        unavailableReason: reasonCode,
+        reason: complete
+          ? REASON_TEXT[reasonCode] || "本轮关键模型证据不足。"
+          : checkingReason(evidence, requestModel, serverModel),
         requestModel: clean(evidence.requestModel),
         serverModel: clean(evidence.serverModel),
         auxiliary: uniqueAuxiliary
@@ -115,6 +205,7 @@
       return {
         status: STATUS.REVIEW,
         label: LABELS[STATUS.REVIEW],
+        unavailableReason: null,
         reason:
           "主字段一致，但一个或多个辅助模型字段与 serverModel 不同，或辅助字段彼此不一致。",
         requestModel: clean(evidence.requestModel),
@@ -127,6 +218,7 @@
       return {
         status: STATUS.MATCH,
         label: LABELS[STATUS.MATCH],
+        unavailableReason: null,
         reason: "客户端请求模型与服务端公开模型标注完全一致。",
         requestModel: clean(evidence.requestModel),
         serverModel: clean(evidence.serverModel),
@@ -144,6 +236,7 @@
       return {
         status: STATUS.MATCH,
         label: LABELS[STATUS.MATCH],
+        unavailableReason: null,
         reason: "两者属于已明确配置的合法路由映射。",
         requestModel: clean(evidence.requestModel),
         serverModel: clean(evidence.serverModel),
@@ -155,6 +248,7 @@
       return {
         status: STATUS.MISMATCH,
         label: LABELS[STATUS.MISMATCH],
+        unavailableReason: null,
         reason: "两者命中了已明确配置的不兼容模型对。",
         requestModel: clean(evidence.requestModel),
         serverModel: clean(evidence.serverModel),
@@ -183,6 +277,7 @@
     return {
       status: STATUS.REVIEW,
       label: LABELS[STATUS.REVIEW],
+      unavailableReason: null,
       reason,
       requestModel: clean(evidence.requestModel),
       serverModel: clean(evidence.serverModel),
@@ -194,6 +289,7 @@
     return {
       status: STATUS.IDLE,
       label: LABELS[STATUS.IDLE],
+      unavailableReason: null,
       reason: "发送一条消息后开始核对本轮模型路由。",
       requestModel: null,
       serverModel: null,
@@ -204,6 +300,8 @@
   return Object.freeze({
     STATUS,
     LABELS,
+    UNAVAILABLE_REASONS,
+    UNAVAILABLE_LABELS,
     clean,
     normalizeModel,
     classify,
