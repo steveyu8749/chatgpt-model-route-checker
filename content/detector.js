@@ -168,18 +168,22 @@
     const now = Date.now();
     cleanupConversationRecords(now);
 
-    const eligible = [...conversationRecords.entries()].filter(([, record]) => {
-      if (!record.telemetryEligible || record.serverModelSeen) return false;
-      return true;
-    });
+    // Settled turns remain competing origins: their telemetry can repeat.
+    // The retention window is deliberately wider than the acceptance window.
+    const recent = [...conversationRecords.entries()];
+    const eligible = recent.filter(([, record]) =>
+      record.telemetryEligible && !record.serverModelSeen
+    );
     const candidates = eligible.filter(([, record]) => {
-      const referenceTime =
-        record.endedAt || record.lastActivityAt || record.startedAt;
-      const window = record.endedAt
+      const referenceTime = record.endedAt ?? record.lastActivityAt ?? record.startedAt;
+      const window = record.endedAt !== null
         ? TELEMETRY_ASSOCIATION_WINDOW_MS
         : ACTIVE_RECORD_RETENTION_MS;
       return now - referenceTime <= window;
     });
+    if (candidates.length && recent.length > 1) {
+      return { requestId: null, outcome: "ambiguous", delayMs: null };
+    }
 
     if (candidates.length === 1) {
       const [requestIdValue, record] = candidates[0];
@@ -215,16 +219,28 @@
     emit("detector-telemetry", { health: healthSnapshot() });
   }
 
-  function processTelemetryText(text) {
+  function processTelemetryText(text, association) {
     incrementTelemetryStat("observed");
     const readable = typeof text === "string" && text.length > 0;
     if (readable) incrementTelemetryStat("readable");
 
-    const association = telemetryAssociation();
     if (association.outcome === "associated") {
-      incrementTelemetryStat("associated");
       const record = conversationRecords.get(association.requestId);
-      const hadServerModel = Boolean(record && record.serverModelSeen);
+      // Do not revive an expired/evicted target after slow body decoding.
+      if (record && record.serverModelSeen) {
+        incrementTelemetryStat("droppedNoCandidate");
+        emitTelemetryHealth();
+        return;
+      }
+      if (!record || Date.now() - (record.endedAt ?? record.lastActivityAt) > (
+        record.endedAt !== null ? TELEMETRY_ASSOCIATION_WINDOW_MS : ACTIVE_RECORD_RETENTION_MS
+      )) {
+        incrementTelemetryStat("droppedExpired");
+        emitTelemetryHealth();
+        return;
+      }
+      incrementTelemetryStat("associated");
+      const hadServerModel = Boolean(record.serverModelSeen);
       if (readable) scanWholeText(text, association.requestId);
       const modelFound = Boolean(
         record && !hadServerModel && record.serverModelSeen
@@ -738,7 +754,7 @@
           eventData.join("\n"),
           requestIdValue,
           stats,
-          { countError: final }
+          { countError: true }
         );
         eventData = [];
       }
@@ -983,6 +999,7 @@
   async function watchStream(response, requestIdValue) {
     const formatHint = responseFormatHint(response);
     let parser = null;
+    let reader = null;
     if (response) {
       markResponseStarted(requestIdValue);
       emit("response-start", {
@@ -1006,7 +1023,7 @@
         return;
       }
 
-      const reader = response.body.getReader();
+      reader = response.body.getReader();
       const decoder = new TextDecoder();
       parser = createStreamParser(requestIdValue, formatHint);
 
@@ -1022,6 +1039,14 @@
             : decoder.decode(result.value, { stream: true })
         );
         emitResponseProgress(requestIdValue, parser.stats);
+        if (parser.stats.sawDone) {
+          // Cancel only our cloned branch; never await tee cancellation,
+          // which can depend on the page finishing its own branch.
+          if (typeof reader.cancel === "function") {
+            Promise.resolve(reader.cancel()).catch(() => {});
+          }
+          break;
+        }
       }
 
       parser.push(decoder.decode(), true);
@@ -1039,6 +1064,8 @@
         responseFormat: parser && parser.stats.responseFormat,
         stats: parser && compactStats(parser.stats)
       });
+    } finally {
+      try { if (reader && reader.releaseLock) reader.releaseLock(); } catch {}
     }
   }
 
@@ -1100,7 +1127,8 @@
     if (typeof nativeFetch !== "function") return;
 
     fetchWrapper = function routeCheckerFetch(input, init) {
-      const url = typeof input === "string" ? input : input && input.url;
+      const url = typeof input === "string" || input instanceof URL
+        ? String(input) : input && input.url;
       const method = methodFor(input, init);
       const conversation = isConversation(url, method);
       const telemetry = isTelemetry(url, method);
@@ -1110,9 +1138,10 @@
         registerConversation(id);
         captureRequestAsync(id, input, init);
       } else if (telemetry) {
+        const association = telemetryAssociation();
         requestBodyText(input, init)
-          .then(processTelemetryText)
-          .catch(() => processTelemetryText(""));
+          .then((text) => processTelemetryText(text, association))
+          .catch(() => processTelemetryText("", association));
       }
 
       let result;
@@ -1196,6 +1225,7 @@
       const conversation = isConversation(url, method);
       const telemetry = isTelemetry(url, method);
       const id = conversation ? requestId() : null;
+      let cleanupXHR = () => {};
 
       if (conversation) {
         registerConversation(id);
@@ -1238,20 +1268,29 @@
           });
         };
 
-        this.addEventListener(
-          "readystatechange",
-          () => {
-            try {
-              if (this.readyState >= 2) markXHRResponseStarted();
-            } catch {
-              // Ignore host object access failures.
-            }
-          }
-        );
+        const onReadyState = () => {
+          try {
+            if (this.readyState >= 2) markXHRResponseStarted();
+          } catch {}
+        };
+        const onProgress = (event) => {
+          markXHRResponseStarted();
+          const stats = createResponseStats(xhrResponseFormatHint(this));
+          stats.byteCount = Number.isFinite(event.loaded) ? event.loaded : 0;
+          emitResponseProgress(id, stats);
+        };
+        this.addEventListener("readystatechange", onReadyState);
+        this.addEventListener("progress", onProgress);
+        cleanupXHR = () => {
+          if (typeof this.removeEventListener !== "function") return;
+          this.removeEventListener("readystatechange", onReadyState);
+          this.removeEventListener("progress", onProgress);
+        };
 
         this.addEventListener(
           "loadend",
           async () => {
+            cleanupXHR();
             const responseType = (() => {
               try {
                 return this.responseType || "";
@@ -1293,14 +1332,16 @@
           { once: true }
         );
       } else if (telemetry) {
+        const association = telemetryAssociation();
         bodyToText(body)
-          .then(processTelemetryText)
-          .catch(() => processTelemetryText(""));
+          .then((text) => processTelemetryText(text, association))
+          .catch(() => processTelemetryText("", association));
       }
 
       try {
         return nativeSend.apply(this, arguments);
       } catch (error) {
+        cleanupXHR();
         if (conversation) closeConversation(id, { endReason: "fetch-error" });
         throw error;
       }
@@ -1325,9 +1366,10 @@
 
     beaconWrapper = function routeCheckerBeacon(url, data) {
       if (isTelemetry(url, "POST")) {
+        const association = telemetryAssociation();
         bodyToText(data)
-          .then(processTelemetryText)
-          .catch(() => processTelemetryText(""));
+          .then((text) => processTelemetryText(text, association))
+          .catch(() => processTelemetryText("", association));
       }
       return nativeBeacon.apply(this, arguments);
     };

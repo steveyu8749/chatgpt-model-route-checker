@@ -6,6 +6,7 @@
   const HOST_ID = "__chatgpt_model_route_checker_host__";
   const MAX_TURNS = 8;
   const RESPONSE_WAIT_TIMEOUT_MS = 30000;
+  const RESPONSE_INACTIVITY_TIMEOUT_MS = 30000;
   const FALLBACK_DISPLAY_METADATA_WAIT_WINDOW_MS = 3000;
   function displayMetadataWaitWindow() {
     try {
@@ -56,7 +57,8 @@
     ...detectorHealth.createState(),
     pingTimer: null,
     timeoutTimer: null,
-    healthCheckTimer: null
+    healthCheckTimer: null,
+    lastHealthAt: null
   };
 
   function clean(value, maxLength = 200) {
@@ -152,6 +154,13 @@
     detectorConnection.healthCheckTimer = window.setTimeout(() => {
       detectorConnection.healthCheckTimer = null;
       if (detectorConnection.status !== "connected") return;
+      if (Date.now() - detectorConnection.lastHealthAt >= 2 * DETECTOR_HEALTHCHECK_INTERVAL_MS) {
+        detectorHealth.timeout(detectorConnection, true);
+        render();
+        sendDetectorPing();
+        scheduleDetectorPing(DETECTOR_RETRY_INTERVAL_MS);
+        return;
+      }
       sendDetectorPing();
       scheduleHealthCheck();
     }, DETECTOR_HEALTHCHECK_INTERVAL_MS);
@@ -206,6 +215,7 @@
   function acceptDetectorHealth(health) {
     const normalized = detectorHealth.accept(detectorConnection, health);
     if (!normalized) return false;
+    detectorConnection.lastHealthAt = Date.now();
     stopDetectorPing();
     scheduleHealthCheck();
     render();
@@ -218,6 +228,8 @@
     if (turn.responseWaitTimer) window.clearTimeout(turn.responseWaitTimer);
     turn.completionTimer = null;
     turn.responseWaitTimer = null;
+    if (turn.inactivityTimer) window.clearTimeout(turn.inactivityTimer);
+    turn.inactivityTimer = null;
   }
 
   const turnStore = turnState.createStore({
@@ -290,6 +302,17 @@
       turnState.timeout(turn, "no-response");
       if (turnStore.isCurrent(turn.id)) render();
     }, RESPONSE_WAIT_TIMEOUT_MS);
+  }
+
+  function scheduleResponseInactivity(turn) {
+    if (!turn || !turn.responseStarted || turn.responseEnded) return;
+    if (turn.inactivityTimer) window.clearTimeout(turn.inactivityTimer);
+    turn.inactivityTimer = window.setTimeout(() => {
+      turn.inactivityTimer = null;
+      if (turn.responseEnded) return;
+      turnState.timeout(turn, "stream-stalled");
+      if (turnStore.isCurrent(turn.id)) render();
+    }, RESPONSE_INACTIVITY_TIMEOUT_MS);
   }
 
   function displayValue(
@@ -506,6 +529,7 @@
   }
 
   function responseReasonLabel(reason) {
+    if (reason === "stream-stalled") return "响应采集停滞";
     const labels = {
       completed: "正常结束",
       "fetch-error": "请求失败",
@@ -898,6 +922,7 @@
           turn.responseWaitTimer = null;
         }
         turnState.startResponse(turn, data.responseFormat);
+        scheduleResponseInactivity(turn);
         // The page can set the new assistant node's model attribute before
         // this postMessage reaches the isolated world. Check it once after
         // marking responseStarted so that a new node is still captured. A
@@ -912,6 +937,10 @@
         }
         break;
       case "response-progress":
+        if (turn.responseEndReason === "stream-stalled") {
+          turnState.startResponse(turn, data.responseFormat);
+        }
+        scheduleResponseInactivity(turn);
         if (typeof data.responseFormat === "string") {
           turn.responseFormat = clean(data.responseFormat, 40) || turn.responseFormat;
         }
@@ -955,6 +984,11 @@
         };
         break;
       case "response-end":
+        if (turn.inactivityTimer) window.clearTimeout(turn.inactivityTimer);
+        turn.inactivityTimer = null;
+        if (turn.responseEndReason === "stream-stalled" || turn.responseEndReason === "no-response") {
+          turnState.startResponse(turn, data.responseFormat);
+        }
         if (turn.responseWaitTimer) {
           window.clearTimeout(turn.responseWaitTimer);
           turn.responseWaitTimer = null;

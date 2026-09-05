@@ -94,6 +94,7 @@
       },
       completionTimer: null,
       responseWaitTimer: null,
+      inactivityTimer: null,
       startedAt: now,
       lastActivityAt: now
     };
@@ -217,6 +218,8 @@
     turn.responseStarted = true;
     turn.responseFormat = clean(responseFormat, 40) || "unknown";
     turn.responseEnded = false;
+    turn.responseEndedAt = null;
+    turn.completedAt = null;
     turn.responseEndReason = null;
     turn.responseUnsupported = false;
     turn.complete = false;

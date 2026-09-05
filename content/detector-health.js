@@ -78,8 +78,8 @@
     return normalized;
   }
 
-  function timeout(state) {
-    if (!state || state.status === "connected") return state;
+  function timeout(state, stale = false) {
+    if (!state || (state.status === "connected" && !stale)) return state;
     state.status = "disconnected";
     return state;
   }

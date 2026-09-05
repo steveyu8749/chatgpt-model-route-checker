@@ -839,3 +839,99 @@ test("a long active conversation remains eligible for unambiguous telemetry", as
   assert.ok(telemetryModel);
   assert.equal(telemetryModel.requestId, request.requestId);
 });
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+const conversationUrl = 'https://chatgpt.com/backend-api/f/conversation';
+const telemetryUrl = 'https://chatgpt.com/ces/v1/telemetry/intake';
+const requestOptions = model => ({ method: 'POST', body: JSON.stringify({ model }) });
+const telemetryOptions = model => ({ method: 'POST', body: JSON.stringify({ server_ste_metadata: { model_slug: model } }) });
+
+test('settled turns still prevent repeated telemetry from entering a newer turn', async () => {
+  const { window, messages } = makeContext('{}');
+  await window.fetch(conversationUrl, requestOptions('model-A')); await settle();
+  await window.fetch(telemetryUrl, telemetryOptions('model-A')); await settle();
+  await window.fetch(conversationUrl, requestOptions('model-B')); await settle();
+  await window.fetch(telemetryUrl, telemetryOptions('model-A')); await settle();
+  const b = messages.filter(m => m.type === 'request').at(-1).requestId;
+  assert.equal(messages.some(m => m.type === 'server-model' && m.requestId === b), false);
+  assert.equal(messages.filter(m => m.type === 'detector-telemetry').at(-1).health.telemetry.droppedAmbiguous, 1);
+});
+
+test('slow telemetry body decoding cannot retarget an expired turn to a new turn', async () => {
+  const clock = { now: 1000 };
+  const { window, messages } = makeContext('{}', null, { clock });
+  await window.fetch(conversationUrl, requestOptions('model-A')); await settle();
+  let release;
+  const body = new Blob(['ignored']);
+  body.text = () => new Promise(resolve => { release = resolve; });
+  await window.fetch(telemetryUrl, { method: 'POST', body });
+  clock.now = 40000;
+  await window.fetch(conversationUrl, requestOptions('model-B')); await settle();
+  release(telemetryOptions('model-A').body); await settle();
+  assert.equal(messages.some(m => m.type === 'server-model'), false);
+});
+
+test('URL objects and Request inputs capture the same conversation', async () => {
+  const { window, messages } = makeContext('{}');
+  await window.fetch(new URL(conversationUrl), requestOptions('model-url'));
+  await window.fetch(new Request(conversationUrl, requestOptions('model-request')));
+  await settle();
+  const models = messages.filter(m => m.type === 'request').map(m => m.model);
+  assert.ok(models.includes('model-url'));
+  assert.ok(models.includes('model-request'));
+});
+
+test('malformed completed SSE event is counted beside valid events', async () => {
+  const { window, messages } = makeContext('data: {"ok":true}\n\ndata: {broken}\n\ndata: [DONE]\n\n');
+  await window.fetch(conversationUrl, requestOptions('model-A')); await settle();
+  const end = messages.find(m => m.type === 'response-end');
+  assert.equal(end.parseErrorCount, 1);
+  assert.equal(end.payloadCount, 1);
+});
+
+test('DONE closes detection without awaiting EOF or clone cancellation', async () => {
+  let reads = 0, cancelled = 0, released = 0;
+  const response = { clone: () => ({ body: { getReader: () => ({
+    read: () => ++reads === 1
+      ? Promise.resolve({ value: 'data: [DONE]\n\n', done: false })
+      : new Promise(() => {}),
+    cancel: () => { cancelled++; return new Promise(() => {}); },
+    releaseLock: () => { released++; }
+  }) } }) };
+  const { window, messages } = makeContext('', async () => response);
+  assert.equal(await window.fetch(conversationUrl, requestOptions('model-A')), response);
+  await settle();
+  assert.equal(messages.filter(m => m.type === 'response-end').length, 1);
+  assert.equal(reads, 1); assert.equal(cancelled, 1); assert.equal(released, 1);
+});
+
+test('finishing the cloned branch leaves the page response readable', async () => {
+  const text = 'data: {"ok":true}\n\ndata: [DONE]\n\n';
+  const { window, messages } = makeContext(text);
+  const response = await window.fetch(conversationUrl, requestOptions('model-A'));
+  assert.equal(await response.text(), text);
+  await settle();
+  assert.equal(messages.filter(m => m.type === 'response-end').length, 1);
+});
+
+test('XHR progress is reported during transfer and listeners are cleaned at loadend', async () => {
+  class XHR extends EventTarget {
+    open() {}
+    send() {}
+  }
+  const clock = { now: 1000 };
+  const { context, messages } = makeContext('', null, { XMLHttpRequest: XHR, clock });
+  const xhr = new context.XMLHttpRequest();
+  xhr.open('POST', conversationUrl); xhr.send('{"model":"model-xhr"}');
+  const progress = () => {
+    const event = new Event('progress'); event.loaded = 123;
+    xhr.dispatchEvent(event);
+  };
+  progress();
+  assert.equal(messages.find(m => m.type === 'response-progress').byteCount, 123);
+  xhr.responseText = '{}'; xhr.status = 200;
+  xhr.dispatchEvent(new Event('loadend')); await settle();
+  const count = messages.filter(m => m.type === 'response-progress').length;
+  clock.now += 2000; progress();
+  assert.equal(messages.filter(m => m.type === 'response-progress').length, count);
+});

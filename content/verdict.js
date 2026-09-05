@@ -28,6 +28,7 @@
     RESPONSE_NOT_CAPTURED: "response-not-captured",
     RESPONSE_NO_FIELDS: "response-no-fields",
     RESPONSE_INTERRUPTED: "response-interrupted",
+    RESPONSE_STALLED: "response-stalled",
     UNSUPPORTED_RESPONSE: "unsupported-response"
   });
 
@@ -36,6 +37,7 @@
     [UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED]: "未捕获响应",
     [UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS]: "服务端未公开",
     [UNAVAILABLE_REASONS.RESPONSE_INTERRUPTED]: "响应中断",
+    [UNAVAILABLE_REASONS.RESPONSE_STALLED]: "响应采集停滞",
     [UNAVAILABLE_REASONS.UNSUPPORTED_RESPONSE]: "格式不支持"
   });
 
@@ -55,6 +57,8 @@
       "已捕获请求，但未捕获到对应的响应。",
     [UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS]:
       "本轮尚未观察到服务端模型标注；若迟到 telemetry 仍在关联窗口内到达，结果会自动更新。",
+    [UNAVAILABLE_REASONS.RESPONSE_STALLED]:
+      "连续 30 秒未观察到响应进度，暂时结束检测；后续收到数据时会自动恢复。",
     [UNAVAILABLE_REASONS.RESPONSE_INTERRUPTED]:
       "响应在读取过程中被中断，未能完成模型字段采集。",
     [UNAVAILABLE_REASONS.UNSUPPORTED_RESPONSE]:
@@ -187,6 +191,8 @@
     if (!evidence.responseStarted) {
       return UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED;
     }
+
+    if (endReason === "stream-stalled") return UNAVAILABLE_REASONS.RESPONSE_STALLED;
 
     if (
       endReason === "read-error" ||
