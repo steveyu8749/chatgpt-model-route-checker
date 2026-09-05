@@ -6,12 +6,19 @@ const root = path.resolve(__dirname, "..");
 const manifest = JSON.parse(
   fs.readFileSync(path.join(root, "manifest.json"), "utf8")
 );
+const packageJson = JSON.parse(
+  fs.readFileSync(path.join(root, "package.json"), "utf8")
+);
 const detector = fs.readFileSync(
   path.join(root, "content", "detector.js"),
   "utf8"
 );
 const content = fs.readFileSync(
   path.join(root, "content", "content.js"),
+  "utf8"
+);
+const turnState = fs.readFileSync(
+  path.join(root, "content", "turn-state.js"),
   "utf8"
 );
 const rules = fs.readFileSync(
@@ -21,9 +28,11 @@ const rules = fs.readFileSync(
 const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 
 assert.equal(manifest.manifest_version, 3);
-assert.equal(manifest.version, "1.1.0");
+assert.equal(manifest.version, "1.1.1");
+assert.equal(packageJson.version, "1.1.1");
 assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"]);
 assert.equal(manifest.content_scripts.length, 2);
+assert.ok(manifest.content_scripts[0].js.includes("content/turn-state.js"));
 assert.deepEqual(manifest.web_accessible_resources, [
   {
     resources: ["content/style.css"],
@@ -44,6 +53,11 @@ assert.match(detector, /server_ste_metadata/);
 assert.match(detector, /window\.postMessage/);
 assert.match(detector, /TELEMETRY_ASSOCIATION_WINDOW_MS/);
 assert.match(detector, /response-start/);
+assert.match(detector, /response-progress/);
+assert.match(detector, /RESPONSE_PROGRESS_INTERVAL_MS/);
+assert.match(detector, /RESPONSE_PROGRESS_INTERVAL_MS = 1000/);
+assert.match(detector, /lastActivityAt/);
+assert.match(detector, /touchConversation\(requestIdValue\)/);
 assert.match(detector, /responseFormatHint/);
 assert.doesNotMatch(detector, /telemetryModelHints/);
 assert.match(detector, /endReason/);
@@ -55,6 +69,9 @@ assert.doesNotMatch(detector, /chrome\.storage/);
 assert.doesNotMatch(detector, /localStorage/);
 assert.doesNotMatch(content, /chrome\.storage/);
 assert.match(content, /NETWORK_EVIDENCE_TYPES/);
+assert.match(content, /ChatGPTRouteTurnState/);
+assert.match(content, /evidenceConflictSummary/);
+assert.match(content, /getManifest\(\)\.version/);
 assert.match(content, /RESPONSE_WAIT_TIMEOUT_MS/);
 assert.match(content, /NETWORK_EVIDENCE_TYPES\.has\(data\.type\) && !eventId/);
 assert.match(content, /RESPONSE_END_GRACE_MS/);
@@ -66,11 +83,16 @@ assert.match(content, /request\.model/);
 assert.match(content, /resolved_model_slug/);
 assert.match(content, /data-message-model-slug/);
 assert.match(content, /getURL\("content\/style\.css"\)/);
+assert.match(turnState, /createStore/);
+assert.match(turnState, /MAX_EVIDENCE_VALUES/);
+assert.match(turnState, /lastActivityAt/);
 assert.match(rules, /equivalent: Object\.freeze\(\[\]\)/);
 assert.match(rules, /incompatible: Object\.freeze\(\[\]\)/);
 assert.match(readme, /不上传/);
 assert.match(readme, /未捕获响应/);
 assert.match(readme, /诊断摘要/);
 assert.match(readme, /不能证明 OpenAI GPU/);
+assert.match(readme, /当前版本：`1\.1\.1`/);
+assert.doesNotMatch(readme, /未捕获请求/);
 
 console.log("Static extension checks passed.");

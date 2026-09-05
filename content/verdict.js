@@ -24,7 +24,6 @@
   // evidence. They are deliberately separate from STATUS.UNAVAILABLE so the
   // UI can explain a failure without treating it as a model mismatch.
   const UNAVAILABLE_REASONS = Object.freeze({
-    NO_REQUEST: "no-request",
     REQUEST_MODEL_MISSING: "request-model-missing",
     RESPONSE_NOT_CAPTURED: "response-not-captured",
     RESPONSE_NO_FIELDS: "response-no-fields",
@@ -33,7 +32,6 @@
   });
 
   const UNAVAILABLE_LABELS = Object.freeze({
-    [UNAVAILABLE_REASONS.NO_REQUEST]: "未捕获请求",
     [UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING]: "请求无模型",
     [UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED]: "未捕获响应",
     [UNAVAILABLE_REASONS.RESPONSE_NO_FIELDS]: "响应无模型",
@@ -51,7 +49,6 @@
   });
 
   const REASON_TEXT = Object.freeze({
-    [UNAVAILABLE_REASONS.NO_REQUEST]: "未捕获到 ChatGPT 对话请求。",
     [UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING]:
       "已捕获对话请求，但请求中没有 request.model。",
     [UNAVAILABLE_REASONS.RESPONSE_NOT_CAPTURED]:
@@ -105,28 +102,83 @@
   }
 
   function modelValues(evidence) {
-    return [
-      evidence.assistantModel,
-      evidence.resolvedModel,
-      evidence.domModel
-    ]
+    return ["assistantModel", "resolvedModel", "domModel"].flatMap((field) =>
+      normalizedFieldValues(evidence, field)
+    );
+  }
+
+  function rawFieldValues(evidence, field) {
+    const suppliedValues =
+      evidence &&
+      evidence.evidenceValues &&
+      Array.isArray(evidence.evidenceValues[field])
+        ? evidence.evidenceValues[field]
+        : null;
+    const supplied =
+      suppliedValues && suppliedValues.length
+        ? suppliedValues
+        : [evidence && evidence[field]];
+    const values = [];
+    const seen = new Set();
+    for (const value of supplied.slice(0, 8)) {
+      const cleaned = clean(value, field === "thinkingEffort" ? 80 : 200);
+      const key = normalizeModel(cleaned);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      values.push(cleaned);
+    }
+    return values;
+  }
+
+  function normalizedFieldValues(evidence, field) {
+    return rawFieldValues(evidence, field)
       .map(normalizeModel)
       .filter(Boolean);
   }
 
-  function hasAuxiliaryConflict(auxiliary, serverModel) {
+  function firstFieldValue(evidence, field) {
+    return rawFieldValues(evidence, field)[0] || null;
+  }
+
+  function hasFieldConflict(evidence, field) {
+    return (
+      rawFieldValues(evidence, field).length > 1 ||
+      Boolean(evidence && evidence.evidenceConflicts && evidence.evidenceConflicts[field])
+    );
+  }
+
+  function conflictDetails(evidence) {
+    const fields = [
+      "requestModel",
+      "serverModel",
+      "assistantModel",
+      "resolvedModel",
+      "domModel",
+      "requestedExperience",
+      "thinkingEffort"
+    ];
+    return Object.fromEntries(
+      fields
+        .filter((field) => hasFieldConflict(evidence, field))
+        .map((field) => [field, rawFieldValues(evidence, field)])
+    );
+  }
+
+  function hasAuxiliaryConflict(evidence, auxiliary, serverModel) {
     // Comparing every non-empty auxiliary value to the primary server value
     // covers both cases: one value disagrees with serverModel, or auxiliary
     // values disagree with each other (because at least one then differs
-    // from serverModel).
-    return auxiliary.some((value) => value !== serverModel);
+    // from serverModel). A field's repeated identical value is not a conflict.
+    return (
+      ["assistantModel", "resolvedModel", "domModel"].some((field) =>
+        hasFieldConflict(evidence, field)
+      ) || auxiliary.some((value) => value !== serverModel)
+    );
   }
 
   function unavailableReason(evidence, requestModel, serverModel) {
     if (!requestModel) {
-      return evidence.requestCaptured
-        ? UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING
-        : UNAVAILABLE_REASONS.NO_REQUEST;
+      return UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING;
     }
 
     if (serverModel) return null;
@@ -175,12 +227,50 @@
 
   function classify(input = {}, options = {}) {
     const evidence = input || {};
-    const requestModel = normalizeModel(evidence.requestModel);
-    const serverModel = normalizeModel(evidence.serverModel);
+    const requestValues = normalizedFieldValues(evidence, "requestModel");
+    const serverValues = normalizedFieldValues(evidence, "serverModel");
+    const requestModel = requestValues[0] || null;
+    const serverModel = serverValues[0] || null;
     const complete = Boolean(evidence.complete);
     const rules = options.rules || {};
     const auxiliary = modelValues(evidence);
     const uniqueAuxiliary = [...new Set(auxiliary)];
+    const primaryConflicts = ["requestModel", "serverModel"].filter((field) =>
+      hasFieldConflict(evidence, field)
+    );
+    const conflicts = conflictDetails(evidence);
+
+    if (primaryConflicts.length) {
+      const details = primaryConflicts
+        .map((field) => `${field}=${rawFieldValues(evidence, field).join(" / ")}`)
+        .join("；");
+      return {
+        status: STATUS.REVIEW,
+        label: LABELS[STATUS.REVIEW],
+        unavailableReason: null,
+        reason: `主证据字段冲突：${details}。无法使用后到值覆盖先到值。`,
+        requestModel: firstFieldValue(evidence, "requestModel"),
+        serverModel: firstFieldValue(evidence, "serverModel"),
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
+      };
+    }
+
+    // No turn has been observed yet. This is the detector-ready/idle state,
+    // not a formal detection failure; a content script cannot observe a
+    // missing request without adding intrusive input/send listeners.
+    if (!evidence.requestCaptured && !requestModel && !serverModel) {
+      return {
+        status: STATUS.IDLE,
+        label: LABELS[STATUS.IDLE],
+        unavailableReason: null,
+        reason: "检测器已就绪，等待 ChatGPT 对话请求。",
+        requestModel: null,
+        serverModel: null,
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
+      };
+    }
 
     if (!requestModel || !serverModel) {
       const reasonCode = complete
@@ -193,13 +283,18 @@
         reason: complete
           ? REASON_TEXT[reasonCode] || "本轮关键模型证据不足。"
           : checkingReason(evidence, requestModel, serverModel),
-        requestModel: clean(evidence.requestModel),
-        serverModel: clean(evidence.serverModel),
-        auxiliary: uniqueAuxiliary
+        requestModel: firstFieldValue(evidence, "requestModel"),
+        serverModel: firstFieldValue(evidence, "serverModel"),
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
       };
     }
 
-    const auxiliaryConflict = hasAuxiliaryConflict(auxiliary, serverModel);
+    const auxiliaryConflict = hasAuxiliaryConflict(
+      evidence,
+      auxiliary,
+      serverModel
+    );
 
     if (requestModel === serverModel && auxiliaryConflict) {
       return {
@@ -208,9 +303,10 @@
         unavailableReason: null,
         reason:
           "主字段一致，但一个或多个辅助模型字段与 serverModel 不同，或辅助字段彼此不一致。",
-        requestModel: clean(evidence.requestModel),
-        serverModel: clean(evidence.serverModel),
-        auxiliary: uniqueAuxiliary
+        requestModel: firstFieldValue(evidence, "requestModel"),
+        serverModel: firstFieldValue(evidence, "serverModel"),
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
       };
     }
 
@@ -220,9 +316,10 @@
         label: LABELS[STATUS.MATCH],
         unavailableReason: null,
         reason: "客户端请求模型与服务端公开模型标注完全一致。",
-        requestModel: clean(evidence.requestModel),
-        serverModel: clean(evidence.serverModel),
-        auxiliary: uniqueAuxiliary
+        requestModel: firstFieldValue(evidence, "requestModel"),
+        serverModel: firstFieldValue(evidence, "serverModel"),
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
       };
     }
 
@@ -238,9 +335,10 @@
         label: LABELS[STATUS.MATCH],
         unavailableReason: null,
         reason: "两者属于已明确配置的合法路由映射。",
-        requestModel: clean(evidence.requestModel),
-        serverModel: clean(evidence.serverModel),
-        auxiliary: uniqueAuxiliary
+        requestModel: firstFieldValue(evidence, "requestModel"),
+        serverModel: firstFieldValue(evidence, "serverModel"),
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
       };
     }
 
@@ -250,9 +348,10 @@
         label: LABELS[STATUS.MISMATCH],
         unavailableReason: null,
         reason: "两者命中了已明确配置的不兼容模型对。",
-        requestModel: clean(evidence.requestModel),
-        serverModel: clean(evidence.serverModel),
-        auxiliary: uniqueAuxiliary
+        requestModel: firstFieldValue(evidence, "requestModel"),
+        serverModel: firstFieldValue(evidence, "serverModel"),
+        auxiliary: uniqueAuxiliary,
+        evidenceConflicts: conflicts
       };
     }
 
@@ -279,9 +378,10 @@
       label: LABELS[STATUS.REVIEW],
       unavailableReason: null,
       reason,
-      requestModel: clean(evidence.requestModel),
-      serverModel: clean(evidence.serverModel),
-      auxiliary: uniqueAuxiliary
+      requestModel: firstFieldValue(evidence, "requestModel"),
+      serverModel: firstFieldValue(evidence, "serverModel"),
+      auxiliary: uniqueAuxiliary,
+      evidenceConflicts: conflicts
     };
   }
 

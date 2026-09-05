@@ -18,15 +18,14 @@
     "response-end"
   ]);
   const api = window.ChatGPTRouteVerdict;
+  const turnState = window.ChatGPTRouteTurnState;
   const rules = window.CHATGPT_ROUTE_CHECKER_RULES || {
     equivalent: [],
     incompatible: []
   };
 
-  if (!api || document.getElementById(HOST_ID)) return;
+  if (!api || !turnState || document.getElementById(HOST_ID)) return;
 
-  const turns = new Map();
-  let currentId = null;
   let expanded = false;
   let ui = null;
 
@@ -34,60 +33,25 @@
     return api.clean(value, maxLength);
   }
 
-  function newTurn(id) {
-    return {
-      id,
-      requestCaptured: false,
-      requestModel: null,
-      serverModel: null,
-      assistantModel: null,
-      resolvedModel: null,
-      requestedExperience: null,
-      domModel: null,
-      thinkingEffort: null,
-      complete: false,
-      responseStarted: false,
-      responseEnded: false,
-      responseEndReason: null,
-      responseFormat: null,
-      responseUnsupported: false,
-      responseStats: {
-        payloadCount: 0,
-        parseErrorCount: 0,
-        eventCount: 0,
-        byteCount: 0,
-        sawDone: false
-      },
-      completionTimer: null,
-      responseWaitTimer: null,
-      startedAt: Date.now()
-    };
+  function clearTurnTimers(turn) {
+    if (!turn) return;
+    if (turn.completionTimer) window.clearTimeout(turn.completionTimer);
+    if (turn.responseWaitTimer) window.clearTimeout(turn.responseWaitTimer);
+    turn.completionTimer = null;
+    turn.responseWaitTimer = null;
   }
 
-  function getTurn(id, create = true) {
-    if (!id) return null;
+  const turnStore = turnState.createStore({
+    maxTurns: MAX_TURNS,
+    onEvict: clearTurnTimers
+  });
 
-    let turn = turns.get(id);
-    if (!turn && create) {
-      turn = newTurn(id);
-      turns.set(id, turn);
-      while (turns.size > MAX_TURNS) {
-        const oldestId = turns.keys().next().value;
-        const oldest = turns.get(oldestId);
-        if (oldest && oldest.completionTimer) {
-          window.clearTimeout(oldest.completionTimer);
-        }
-        if (oldest && oldest.responseWaitTimer) {
-          window.clearTimeout(oldest.responseWaitTimer);
-        }
-        turns.delete(oldestId);
-      }
-    }
-    return turn;
+  function getTurn(id, create = true) {
+    return turnStore.get(id, create);
   }
 
   function currentTurn() {
-    return currentId ? turns.get(currentId) : null;
+    return turnStore.current();
   }
 
   function scheduleCompletion(turn) {
@@ -99,8 +63,8 @@
     // during this short grace period so "无法检测" does not flash early.
     turn.completionTimer = window.setTimeout(() => {
       turn.completionTimer = null;
-      turn.complete = true;
-      if (currentId === turn.id) render();
+      turnState.complete(turn);
+      if (turnStore.isCurrent(turn.id)) render();
     }, RESPONSE_END_GRACE_MS);
   }
 
@@ -110,10 +74,8 @@
     turn.responseWaitTimer = window.setTimeout(() => {
       turn.responseWaitTimer = null;
       if (turn.responseStarted || turn.responseEnded) return;
-      turn.responseEnded = true;
-      turn.responseEndReason = "no-response";
-      turn.complete = true;
-      if (currentId === turn.id) render();
+      turnState.timeout(turn, "no-response");
+      if (turnStore.isCurrent(turn.id)) render();
     }, RESPONSE_WAIT_TIMEOUT_MS);
   }
 
@@ -122,11 +84,50 @@
     return waiting ? "等待服务端…" : optional ? "未提供（可选）" : "未获取";
   }
 
-  function modelLine(result) {
-    if (!result.requestModel && !result.serverModel) {
+  const FIELD_LABELS = Object.freeze({
+    requestModel: "客户端 request.model",
+    serverModel: "服务端 server_ste_metadata.model_slug",
+    assistantModel: "assistant metadata.model_slug",
+    resolvedModel: "resolved_model_slug",
+    requestedExperience: "requested_model_experience",
+    domModel: "DOM data-message-model-slug",
+    thinkingEffort: "request.thinking_effort"
+  });
+
+  function evidenceValues(turn, field) {
+    return turn ? turnState.getEvidenceValues(turn, field) : [];
+  }
+
+  function formatEvidenceValue(
+    turn,
+    field,
+    optional = false,
+    waiting = false
+  ) {
+    const values = evidenceValues(turn, field);
+    if (values.length > 1) return `${values.join(" / ")}（冲突）`;
+    return displayValue(values[0], waiting, optional);
+  }
+
+  function evidenceConflictSummary(turn) {
+    if (!turn) return "";
+    return turnState
+      .allConflictFields(turn)
+      .map((field) => `${FIELD_LABELS[field]}=${evidenceValues(turn, field).join(" / ")}`)
+      .join("；");
+  }
+
+  function modelLine(result, turn) {
+    if (!turn) {
       return "发送消息后显示本轮模型";
     }
-    return `${displayValue(result.requestModel)} → ${displayValue(result.serverModel)}`;
+    const serverWaiting = turn.responseStarted && !turn.responseEnded;
+    return `${formatEvidenceValue(turn, "requestModel")} → ${formatEvidenceValue(
+      turn,
+      "serverModel",
+      false,
+      serverWaiting
+    )}`;
   }
 
   function resultForTurn(turn) {
@@ -138,14 +139,18 @@
         serverModel: turn.serverModel,
         assistantModel: turn.assistantModel,
         resolvedModel: turn.resolvedModel,
+        requestedExperience: turn.requestedExperience,
         domModel: turn.domModel,
+        thinkingEffort: turn.thinkingEffort,
         complete: turn.complete,
         requestCaptured: turn.requestCaptured,
         responseStarted: turn.responseStarted,
         responseEnded: turn.responseEnded,
         responseEndReason: turn.responseEndReason,
         responseFormat: turn.responseFormat,
-        responseUnsupported: turn.responseUnsupported
+        responseUnsupported: turn.responseUnsupported,
+        evidenceValues: turn.evidenceValues,
+        evidenceConflicts: turn.evidenceConflicts
       },
       { rules }
     );
@@ -166,7 +171,12 @@
       "route-field-value",
       displayValue(value, false, optional)
     );
-    if (!value && optional) valueElement.classList.add("is-optional");
+    if (
+      optional &&
+      (!value || value === "未提供（可选）")
+    ) {
+      valueElement.classList.add("is-optional");
+    }
     row.append(labelElement, valueElement);
     return row;
   }
@@ -289,7 +299,7 @@
   }
 
   function diagnosticSummary(turn) {
-    if (!turn) return "尚未捕获本轮请求。";
+    if (!turn) return "检测器已就绪，等待 ChatGPT 对话请求。";
 
     const stats = turn.responseStats || {};
     const requestState = turn.requestCaptured
@@ -305,38 +315,74 @@
         ? `未捕获，${responseReasonLabel(turn.responseEndReason)}`
         : "未捕获，等待中";
 
-    return [
+    const parts = [
       `请求：${requestState}`,
       `响应：${responseState}`,
       `格式：${responseFormatLabel(turn.responseFormat)}`,
       `事件：${safeCount(stats.eventCount)}，JSON 载荷：${safeCount(
         stats.payloadCount
-      )}，解析异常：${safeCount(stats.parseErrorCount)}`
-    ].join("；");
+      )}，解析异常：${safeCount(stats.parseErrorCount)}，字节数：${safeCount(
+        stats.byteCount
+      )}`
+    ];
+    const conflicts = evidenceConflictSummary(turn);
+    if (conflicts) parts.push(`证据冲突：${conflicts}`);
+    return parts.join("；");
+  }
+
+  function extensionVersion() {
+    try {
+      return clean(chrome.runtime.getManifest().version, 40) || "未知";
+    } catch {
+      return "未知";
+    }
   }
 
   function formatCopyText(turn, result) {
     const current = turn || {};
-    const optional = (value) => value || "未提供（可选）";
     return [
+      `扩展版本：${extensionVersion()}`,
       `状态：${displayStatusLabel(result)}`,
       `判定理由：${result.reason}`,
       `不可用原因：${
         result.unavailableReason || "不适用"
       }`,
       `诊断摘要：${diagnosticSummary(turn)}`,
-      `客户端 request.model：${current.requestModel || "未获取"}`,
-      `服务端 server_ste_metadata.model_slug：${current.serverModel || "未获取"}`,
-      `assistant metadata.model_slug：${optional(current.assistantModel)}`,
-      `resolved_model_slug：${optional(current.resolvedModel)}`,
-      `requested_model_experience：${optional(current.requestedExperience)}`,
-      `DOM data-message-model-slug：${optional(current.domModel)}`,
-      `request.thinking_effort：${optional(current.thinkingEffort)}`,
+      `${FIELD_LABELS.requestModel}：${formatEvidenceValue(
+        turn,
+        "requestModel"
+      )}`,
+      `${FIELD_LABELS.serverModel}：${formatEvidenceValue(
+        turn,
+        "serverModel"
+      )}`,
+      `${FIELD_LABELS.assistantModel}：${formatEvidenceValue(
+        turn,
+        "assistantModel",
+        true
+      )}`,
+      `${FIELD_LABELS.resolvedModel}：${formatEvidenceValue(
+        turn,
+        "resolvedModel",
+        true
+      )}`,
+      `${FIELD_LABELS.requestedExperience}：${formatEvidenceValue(
+        turn,
+        "requestedExperience",
+        true
+      )}`,
+      `${FIELD_LABELS.domModel}：${formatEvidenceValue(turn, "domModel", true)}`,
+      `${FIELD_LABELS.thinkingEffort}：${formatEvidenceValue(
+        turn,
+        "thinkingEffort",
+        true
+      )}`,
       `响应格式：${responseFormatLabel(current.responseFormat)}`,
       `响应结束原因：${responseReasonLabel(current.responseEndReason)}`,
       `响应事件数：${safeCount(current.responseStats?.eventCount)}`,
       `JSON 载荷数：${safeCount(current.responseStats?.payloadCount)}`,
-      `解析异常数：${safeCount(current.responseStats?.parseErrorCount)}`
+      `解析异常数：${safeCount(current.responseStats?.parseErrorCount)}`,
+      `响应字节数：${safeCount(current.responseStats?.byteCount)}`
     ].join("\n");
   }
 
@@ -375,23 +421,29 @@
     ui.status.textContent = `${statusIcon(result.status)} ${displayStatusLabel(
       result
     )}`;
-    ui.line.textContent = modelLine(result);
+    ui.line.textContent = modelLine(result, turn);
     ui.reason.textContent = result.reason;
     ui.diagnostic.textContent = `诊断：${diagnosticSummary(turn)}`;
     ui.summary.title = result.reason;
 
     const fields = [
-      ["客户端 request.model", turn && turn.requestModel, false],
-      ["服务端 server_ste_metadata.model_slug", turn && turn.serverModel, false],
-      ["assistant metadata.model_slug", turn && turn.assistantModel, true],
-      ["resolved_model_slug", turn && turn.resolvedModel, true],
-      ["requested_model_experience", turn && turn.requestedExperience, true],
-      ["DOM data-message-model-slug", turn && turn.domModel, true],
-      ["request.thinking_effort", turn && turn.thinkingEffort, true]
+      [FIELD_LABELS.requestModel, "requestModel", false],
+      [FIELD_LABELS.serverModel, "serverModel", false],
+      [FIELD_LABELS.assistantModel, "assistantModel", true],
+      [FIELD_LABELS.resolvedModel, "resolvedModel", true],
+      [FIELD_LABELS.requestedExperience, "requestedExperience", true],
+      [FIELD_LABELS.domModel, "domModel", true],
+      [FIELD_LABELS.thinkingEffort, "thinkingEffort", true]
     ];
 
     ui.fields.replaceChildren(
-      ...fields.map(([label, value, optional]) => makeField(label, value, optional))
+      ...fields.map(([label, field, optional]) =>
+        makeField(
+          label,
+          turn ? formatEvidenceValue(turn, field, optional) : null,
+          optional
+        )
+      )
     );
   }
 
@@ -448,33 +500,32 @@
       const id = clean(data.requestId, 80);
       if (!id) return;
 
-      const existing = turns.get(id);
-      const turn = existing || getTurn(id);
+      const result = turnStore.beginRequest(id, {
+        model: data.model,
+        thinkingEffort: data.thinkingEffort
+      });
+      const turn = result && result.turn;
       if (!turn) return;
 
-      // The bridge can send a second request event after cloning a Request.
-      // Keep response evidence already collected for this same turn.
-      turn.requestCaptured = true;
+      // Capture the last assistant node before this request starts. Existing
+      // DOM nodes can be detached and re-mounted while a new response is
+      // being built; their old slug must not become evidence for this turn.
+      if (!turn.domBaselineSet) {
+        turn.domBaselineNode = lastAssistantNode();
+        turn.domBaselineSet = true;
+      }
+
       scheduleResponseWait(turn);
-      if (typeof data.model === "string") {
-        const model = clean(data.model);
-        if (model) turn.requestModel = model;
-      }
-      if (typeof data.thinkingEffort === "string") {
-        const thinkingEffort = clean(data.thinkingEffort, 80);
-        if (thinkingEffort) turn.thinkingEffort = thinkingEffort;
-      }
       // A first request event starts the visible turn. A duplicate request
       // event can arrive later when a Request clone finishes reading; never
       // let that late update switch the card back to an older turn.
-      if (!existing || !currentId) currentId = id;
-      if (currentId === id) render();
+      if (result.isCurrent) render();
       return;
     }
 
     const eventId = clean(data.requestId, 80);
     if (NETWORK_EVIDENCE_TYPES.has(data.type) && !eventId) return;
-    const wasCurrent = !currentId || !eventId || eventId === currentId;
+    const wasCurrent = !eventId || turnStore.isCurrent(eventId);
     const turn = eventTurn(data);
     if (!turn) return;
 
@@ -485,12 +536,15 @@
           window.clearTimeout(turn.responseWaitTimer);
           turn.responseWaitTimer = null;
         }
-        turn.responseStarted = true;
-        turn.responseFormat = clean(data.responseFormat, 40) || "unknown";
-        turn.responseEnded = false;
-        turn.responseEndReason = null;
-        turn.responseUnsupported = false;
-        turn.complete = false;
+        turnState.startResponse(turn, data.responseFormat);
+        // The page can set the new assistant node's model attribute before
+        // this postMessage reaches the isolated world. Check it once after
+        // marking responseStarted so that a new node is still captured. A
+        // baseline node is rejected here unless a later attribute mutation
+        // explicitly changes it (see maybeReadDomModel).
+        if (wasCurrent) {
+          maybeReadDomModel(lastAssistantNode(), "response-start");
+        }
         if (turn.completionTimer) {
           window.clearTimeout(turn.completionTimer);
           turn.completionTimer = null;
@@ -500,41 +554,38 @@
         if (typeof data.responseFormat === "string") {
           turn.responseFormat = clean(data.responseFormat, 40) || turn.responseFormat;
         }
-        updateResponseStats(turn, data);
+        turnState.updateResponseStats(turn, data);
         break;
       case "server-model":
-        turn.serverModel = value;
+        turnState.addEvidence(turn, "serverModel", value);
         break;
       case "assistant-model":
-        turn.assistantModel = value;
+        turnState.addEvidence(turn, "assistantModel", value);
         break;
       case "resolved-model":
-        turn.resolvedModel = value;
+        turnState.addEvidence(turn, "resolvedModel", value);
         break;
       case "requested-experience":
-        turn.requestedExperience = value;
+        turnState.addEvidence(turn, "requestedExperience", value);
         break;
       case "dom-model":
-        turn.domModel = value;
+        turnState.addEvidence(turn, "domModel", value);
         break;
       case "thinking-effort":
-        turn.thinkingEffort = value;
+        turnState.addEvidence(turn, "thinkingEffort", value);
         break;
       case "response-end":
         if (turn.responseWaitTimer) {
           window.clearTimeout(turn.responseWaitTimer);
           turn.responseWaitTimer = null;
         }
-        turn.responseEnded = true;
-        turn.responseEndReason = clean(data.endReason, 80) || "completed";
-        turn.responseStarted =
-          typeof data.responseStarted === "boolean"
-            ? data.responseStarted
-            : turn.responseStarted;
-        turn.responseFormat =
-          clean(data.responseFormat, 40) || turn.responseFormat || "unknown";
-        turn.responseUnsupported = Boolean(data.responseUnsupported);
-        updateResponseStats(turn, data);
+        turnState.endResponse(turn, {
+          endReason: data.endReason,
+          responseStarted: data.responseStarted,
+          responseFormat: data.responseFormat,
+          responseUnsupported: data.responseUnsupported,
+          stats: data
+        });
         scheduleCompletion(turn);
         break;
       default:
@@ -544,24 +595,7 @@
     // A delayed response from an older concurrent request may still arrive.
     // It updates its own in-memory record, but must not pull the visible card
     // away from the newest request.
-    if (!currentId && eventId) currentId = eventId;
     if (wasCurrent) render();
-  }
-
-  function updateResponseStats(turn, data) {
-    if (!turn || !data) return;
-    const stats = turn.responseStats || (turn.responseStats = {});
-    for (const key of [
-      "payloadCount",
-      "parseErrorCount",
-      "eventCount",
-      "byteCount"
-    ]) {
-      if (Number.isFinite(data[key])) {
-        stats[key] = Math.min(Math.max(Math.floor(data[key]), 0), 100000);
-      }
-    }
-    if (typeof data.sawDone === "boolean") stats.sawDone = data.sawDone;
   }
 
   function lastAssistantNode() {
@@ -571,24 +605,25 @@
     return nodes.length ? nodes[nodes.length - 1] : null;
   }
 
-  function maybeReadDomModel(node) {
+  function maybeReadDomModel(node, source = "attribute") {
     const turn = currentTurn();
-    if (!turn || !node || node !== lastAssistantNode()) return;
+    if (!turnState.shouldAcceptDomEvidence(turn, node, source)) return;
+    if (node !== lastAssistantNode()) return;
 
     const value = clean(node.getAttribute("data-message-model-slug"));
     if (!value) return;
 
-    turn.domModel = value;
+    turnState.addEvidence(turn, "domModel", value);
     render();
   }
 
   function inspectAddedNode(node) {
-    if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
-    maybeReadDomModel(node);
+    if (!node || node.nodeType !== 1) return;
+    maybeReadDomModel(node, "childList");
     for (const child of node.querySelectorAll(
       '[data-message-author-role="assistant"]'
     )) {
-      maybeReadDomModel(child);
+      maybeReadDomModel(child, "childList");
     }
   }
 

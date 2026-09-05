@@ -35,6 +35,7 @@ function makeContext(responseText, fetchImpl, options = {}) {
     URLSearchParams,
     ArrayBuffer,
     TextDecoder,
+    TextEncoder,
     WeakSet,
     setTimeout,
     clearTimeout,
@@ -115,6 +116,55 @@ test("fetch bridge emits model evidence without forwarding message content", asy
   assert.equal(responseEnd.responseUnsupported, false);
 });
 
+test("long responses emit throttled progress snapshots without response text", async () => {
+  const chunks = [
+    `data: ${JSON.stringify({ type: "progress-only", value: "ignored" })}\n\n`,
+    `data: ${JSON.stringify({ server_ste_metadata: { model_slug: "gpt-progress" } })}\n\n`
+  ];
+  const clock = { now: 0 };
+  let index = 0;
+  const response = {
+    headers: { get: () => "text/event-stream" },
+    clone() {
+      return {
+        headers: this.headers,
+        body: {
+          getReader() {
+            return {
+              async read() {
+                if (index >= chunks.length) return { done: true };
+                // Advance the detector's injected clock without making the
+                // test wait for real time. Each chunk is more than the 1 s
+                // production throttle interval apart.
+                clock.now += 1001;
+                return { done: false, value: chunks[index++] };
+              }
+            };
+          }
+        }
+      };
+    }
+  };
+  const { window, messages } = makeContext("", async () => response, { clock });
+
+  await window.fetch("https://chatgpt.com/backend-api/f/conversation", {
+    method: "POST",
+    body: JSON.stringify({ model: "gpt-progress" })
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const progress = messages.filter((message) => message.type === "response-progress");
+  assert.ok(progress.length >= 2);
+  for (const message of progress) {
+    assert.ok(message.requestId);
+    assert.ok(message.eventCount <= 100000);
+    assert.ok(message.payloadCount <= 100000);
+    assert.ok(message.byteCount <= 2 * 1024 * 1024);
+    assert.equal(Object.prototype.hasOwnProperty.call(message, "text"), false);
+    assert.doesNotMatch(JSON.stringify(message), /progress-only|ignored/);
+  }
+});
+
 test("non-ChatGPT URLs are not intercepted", async () => {
   const { window, messages } = makeContext("{}");
   await window.fetch("https://example.com/backend-api/f/conversation", {
@@ -147,10 +197,7 @@ test("a rejected native fetch closes the turn while preserving rejection", async
 
 test("ordinary JSON responses and conversation path variants are detected", async () => {
   const response = new Response(
-    JSON.stringify({
-      server_ste_metadata: { model_slug: "gpt-json" },
-      resolved_model_slug: "gpt-json"
-    }),
+    '{\n  "server_ste_metadata": { "model_slug": "gpt-json" },\n\n  "resolved_model_slug": "gpt-json"\n}',
     { headers: { "content-type": "application/json" } }
   );
   const { window, messages } = makeContext("", async () => response);
@@ -170,6 +217,7 @@ test("ordinary JSON responses and conversation path variants are detected", asyn
   assert.equal(end.responseFormat, "json");
   assert.equal(end.responseStarted, true);
   assert.equal(end.responseUnsupported, false);
+  assert.equal(end.parseErrorCount, 0);
   assert.equal(
     messages.find((message) => message.type === "server-model").value,
     "gpt-json"
@@ -302,6 +350,7 @@ test("an unrecognized non-empty response is reported as unsupported format", asy
   assert.equal(end.responseFormat, "unknown");
   assert.equal(end.responseUnsupported, true);
   assert.equal(end.payloadCount, 0);
+  assert.ok(end.parseErrorCount > 0);
 });
 
 test("incremental SSE chunks split inside JSON lines still emit all model fields", async () => {
@@ -336,6 +385,10 @@ test("incremental SSE chunks split inside JSON lines still emit all model fields
   assert.equal(
     messages.find((message) => message.type === "assistant-model").value,
     "gpt-stream"
+  );
+  assert.equal(
+    messages.find((message) => message.type === "response-end").parseErrorCount,
+    0
   );
   assert.ok(messages.some((message) => message.type === "response-end"));
 });

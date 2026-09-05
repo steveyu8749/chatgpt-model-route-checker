@@ -205,7 +205,7 @@ test("default rules contain no invented model mappings", () => {
   assert.equal(unknown.status, verdict.STATUS.REVIEW);
 });
 
-test("unavailable reasons identify a missing request separately", () => {
+test("an unobserved request is the detector-ready idle state", () => {
   const noRequest = verdict.classify({ complete: true });
   const noModel = verdict.classify({
     requestCaptured: true,
@@ -214,11 +214,9 @@ test("unavailable reasons identify a missing request separately", () => {
     complete: true
   });
 
-  assert.equal(
-    noRequest.unavailableReason,
-    verdict.UNAVAILABLE_REASONS.NO_REQUEST
-  );
-  assert.match(noRequest.reason, /未捕获.*请求/);
+  assert.equal(noRequest.status, verdict.STATUS.IDLE);
+  assert.equal(noRequest.unavailableReason, null);
+  assert.match(noRequest.reason, /检测器已就绪/);
   assert.equal(
     noModel.unavailableReason,
     verdict.UNAVAILABLE_REASONS.REQUEST_MODEL_MISSING

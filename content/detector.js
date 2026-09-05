@@ -1,4 +1,4 @@
-/* global window, navigator, XMLHttpRequest, Request, Blob, URLSearchParams */
+/* global window, navigator, XMLHttpRequest, Request, Blob, URLSearchParams, TextEncoder */
 /*
  * MAIN-world bridge.
  *
@@ -18,6 +18,7 @@
   const TELEMETRY_ASSOCIATION_WINDOW_MS = 6000;
   const ACTIVE_RECORD_RETENTION_MS = 5 * 60 * 1000;
   const ENDED_RECORD_RETENTION_MS = 15000;
+  const RESPONSE_PROGRESS_INTERVAL_MS = 1000;
   const SKIP_RECURSION_KEYS = new Set([
     "content",
     "parts",
@@ -46,6 +47,17 @@
     return result ? result.slice(0, maxLength) : null;
   }
 
+  function utf8ByteLength(value) {
+    if (typeof value !== "string" || !value) return 0;
+    try {
+      return new TextEncoder().encode(value).byteLength;
+    } catch {
+      // TextEncoder is available in supported browsers; retain a bounded
+      // fallback for unusual host objects and the parser's test doubles.
+      return value.length;
+    }
+  }
+
   function requestId() {
     sequence += 1;
     return `turn-${Date.now().toString(36)}-${sequence.toString(36)}`;
@@ -53,7 +65,8 @@
 
   function cleanupConversationRecords(now = Date.now()) {
     for (const [id, record] of conversationRecords) {
-      const referenceTime = record.endedAt || record.startedAt;
+      const referenceTime =
+        record.endedAt || record.lastActivityAt || record.startedAt;
       const retention = record.endedAt
         ? ENDED_RECORD_RETENTION_MS
         : ACTIVE_RECORD_RETENTION_MS;
@@ -116,7 +129,8 @@
 
     const candidates = [...conversationRecords.entries()].filter(([, record]) => {
       if (!record.telemetryEligible || record.serverModelSeen) return false;
-      const referenceTime = record.endedAt || record.startedAt;
+      const referenceTime =
+        record.endedAt || record.lastActivityAt || record.startedAt;
       const window = record.endedAt
         ? TELEMETRY_ASSOCIATION_WINDOW_MS
         : ACTIVE_RECORD_RETENTION_MS;
@@ -458,15 +472,16 @@
       eventCount: 0,
       byteCount: 0,
       sawDone: false,
-      sawSseField: formatHint === "sse",
-      sawJson: formatHint === "json"
+      sawSseField: false,
+      sawJson: false
     };
   }
 
   function parseJSONCandidate(
     text,
     requestIdValue,
-    stats
+    stats,
+    options = {}
   ) {
     if (!text || typeof text !== "string") return false;
 
@@ -492,8 +507,10 @@
       if (stats.responseFormat === "unknown") stats.responseFormat = "json";
       return true;
     } catch {
-      // Ignore non-JSON stream fragments; do not inspect or forward them.
-      stats.parseErrorCount += 1;
+      // Incremental SSE and pretty-printed JSON commonly fail to parse until
+      // their next chunk/line arrives. Count an error only when the parser is
+      // being finalized and the complete buffered candidate still fails.
+      if (options.countError) stats.parseErrorCount += 1;
       return false;
     }
   }
@@ -507,33 +524,38 @@
     let rawJson = "";
     const stats = createResponseStats(formatHint);
 
-    function finishRawJson(force = false) {
+    function finishRawJson(force = false, final = false) {
       if (!rawJson) return;
       const complete = parseJSONCandidate(
         rawJson,
         requestIdValue,
-        stats
+        stats,
+        { countError: final }
       );
       if (complete || force) rawJson = "";
     }
 
-    function finishEvent() {
+    function finishEvent(final = false) {
       if (eventData.length) {
         stats.eventCount += 1;
         parseJSONCandidate(
           eventData.join("\n"),
           requestIdValue,
-          stats
+          stats,
+          { countError: final }
         );
         eventData = [];
       }
-      finishRawJson(true);
+      // A blank line terminates an SSE event, but it is also valid whitespace
+      // inside a pretty-printed JSON response. Keep an unframed JSON buffer
+      // until finalization unless an SSE field has actually been observed.
+      if (stats.sawSseField || !rawJson) finishRawJson(true, final);
     }
 
-    function processLine(rawLine) {
+    function processLine(rawLine, final = false) {
       const line = rawLine.trim();
       if (!line) {
-        finishEvent();
+        finishEvent(final);
         return;
       }
 
@@ -544,7 +566,7 @@
         if (stats.responseFormat === "unknown") stats.responseFormat = "sse";
         // Be tolerant of servers that omit the usual blank line between
         // events: a new event field closes the prior data envelope.
-        if (eventData.length) finishEvent();
+        if (eventData.length) finishEvent(final);
         return;
       }
       if (
@@ -559,7 +581,7 @@
       if (line.startsWith("data:")) {
         stats.sawSseField = true;
         if (stats.responseFormat === "unknown") stats.responseFormat = "sse";
-        finishRawJson(true);
+        finishRawJson(true, final);
         const piece = line.slice(5).trimStart();
 
         // Parse complete data lines immediately. If a JSON value is split
@@ -601,7 +623,7 @@
     function push(text, final = false) {
       if (typeof text === "string" && text) {
         lineBuffer += text;
-        stats.byteCount += text.length;
+        stats.byteCount += utf8ByteLength(text);
       }
 
       while (lineBuffer) {
@@ -635,10 +657,23 @@
 
       if (final) {
         if (lineBuffer) {
-          processLine(lineBuffer);
+          processLine(lineBuffer, true);
           lineBuffer = "";
         }
-        finishEvent();
+        finishEvent(true);
+
+        // If no SSE field or JSON payload was recognized, the complete
+        // non-empty response is unsupported. This catches plain text and
+        // malformed scalar responses without treating normal incremental
+        // parsing retries as errors.
+        if (
+          stats.byteCount > 0 &&
+          stats.payloadCount === 0 &&
+          stats.parseErrorCount === 0 &&
+          !stats.sawDone
+        ) {
+          stats.parseErrorCount = 1;
+        }
       }
     }
 
@@ -654,7 +689,7 @@
     // Parse a complete JSON response directly first. This also handles
     // pretty-printed JSON that has no line-oriented framing.
     const stats = createResponseStats(formatHint);
-    stats.byteCount = text.length;
+    stats.byteCount = utf8ByteLength(text);
     const trimmed = text.trim();
     if (
       text.length <= STREAM_BUFFER_LIMIT &&
@@ -705,14 +740,40 @@
       eventCount: Number.isFinite(source.eventCount)
         ? Math.min(Math.max(source.eventCount, 0), 100000)
         : 0,
+      byteCount: Number.isFinite(source.byteCount)
+        ? Math.min(Math.max(source.byteCount, 0), STREAM_BUFFER_LIMIT)
+        : 0,
       sawDone: Boolean(source.sawDone),
       responseUnsupported: Boolean(
-        (source.responseFormat === "unknown" ||
-          (source.responseFormat === "json" && source.parseErrorCount > 0)) &&
+        (source.responseFormat === "unknown" || source.parseErrorCount > 0) &&
           source.byteCount > 0 &&
           source.payloadCount === 0
       )
     };
+  }
+
+  function emitResponseProgress(requestIdValue, stats, clock = Date.now) {
+    if (!requestIdValue || !stats) return;
+    const now = clock();
+    const record = conversationRecords.get(requestIdValue);
+    if (!record) return;
+    // The final snapshot is also rate limited. response-end carries the
+    // authoritative final counters, so a second progress event immediately
+    // before it is unnecessary and would defeat the throttle.
+    if (
+      Number.isFinite(record.lastProgressAt) &&
+      now - record.lastProgressAt < RESPONSE_PROGRESS_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    record.lastProgressAt = now;
+    touchConversation(requestIdValue);
+    emit("response-progress", {
+      requestId: requestIdValue,
+      responseFormat: stats.responseFormat || "unknown",
+      ...compactStats(stats)
+    });
   }
 
   function networkFailureReason(error, fallback) {
@@ -740,6 +801,7 @@
           ? await response.text()
           : "";
         const stats = scanWholeText(text, requestIdValue, { formatHint });
+        emitResponseProgress(requestIdValue, stats);
         closeConversation(requestIdValue, {
           endReason: "completed",
           responseFormat: stats.responseFormat || formatHint,
@@ -754,15 +816,20 @@
 
       while (true) {
         const result = await reader.read();
+        // Keep active records alive for long responses. This timestamp is
+        // local bookkeeping only; no response text or chunk is forwarded.
+        touchConversation(requestIdValue);
         if (result.done) break;
         parser.push(
           typeof result.value === "string"
             ? result.value
             : decoder.decode(result.value, { stream: true })
         );
+        emitResponseProgress(requestIdValue, parser.stats);
       }
 
       parser.push(decoder.decode(), true);
+      emitResponseProgress(requestIdValue, parser.stats);
       closeConversation(requestIdValue, {
         endReason: "completed",
         responseFormat: parser.stats.responseFormat,
@@ -770,6 +837,7 @@
       });
     } catch (error) {
       // Reading a clone can fail if the page cancels/navigation closes it.
+      if (parser) emitResponseProgress(requestIdValue, parser.stats);
       closeConversation(requestIdValue, {
         endReason: networkFailureReason(error, "read-error"),
         responseFormat: parser && parser.stats.responseFormat,
@@ -1000,6 +1068,7 @@
               if (hasResponse) {
                 const formatHint = xhrResponseFormatHint(this);
                 const stats = await scanXHRResponse(this, id, formatHint);
+                emitResponseProgress(id, stats);
                 closeConversation(id, {
                   endReason: "completed",
                   responseFormat: stats.responseFormat || formatHint,
